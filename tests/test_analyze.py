@@ -53,6 +53,65 @@ def test_build_user_prompt_injects_pr_markdown() -> None:
     assert "# PR 内容" in up
 
 
+def test_extract_stream_delta_anthropic() -> None:
+    evt = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "abc"}}
+    assert list(analyze._extract_stream_delta(evt)) == [("text", "abc")]
+    evt = {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "想"}}
+    assert list(analyze._extract_stream_delta(evt)) == [("thinking", "想")]
+
+
+def test_extract_stream_delta_openai() -> None:
+    evt = {"choices": [{"delta": {"content": "hi", "reasoning_content": "推理"}}]}
+    out = list(analyze._extract_stream_delta(evt))
+    assert ("thinking", "推理") in out
+    assert ("text", "hi") in out
+
+
+def test_analyze_pr_stream_emits_status_and_result(monkeypatch) -> None:
+    """流式分析应先出 status，再逐段 text，最后给出解析好的 result。"""
+    from pr_learner.fetch import PullRequest
+
+    fake_pr = PullRequest(
+        repo="o/r", number=5, title="兜底标题", author="a", state="MERGED",
+        url="u", body="b", diff="d",
+    )
+    monkeypatch.setattr(analyze, "fetch_pr", lambda repo, number: fake_pr)
+    # 模型分两段吐出一个完整 JSON
+    monkeypatch.setattr(
+        analyze,
+        "_iter_llm_stream",
+        lambda *a, **k: iter([
+            ("thinking", "先看 diff"),
+            ("text", '{"title":"标题","category":"网络",'),
+            ("text", '"tags":["tcp"],"content":"正文"}'),
+        ]),
+    )
+    events = list(analyze.analyze_pr_stream("o/r", 5, api_key="sk", model="m"))
+    kinds = [e["type"] for e in events]
+    assert kinds[0] == "status"
+    assert "thinking" in kinds and "text" in kinds
+    assert kinds[-1] == "result"
+    fields = events[-1]["fields"]
+    assert fields["title"] == "标题"
+    assert fields["tags"] == ["tcp"]
+    assert fields["source_pr"] == "o/r#5"
+
+
+def test_analyze_pr_stream_reports_error_on_bad_json(monkeypatch) -> None:
+    from pr_learner.fetch import PullRequest
+
+    fake_pr = PullRequest(
+        repo="o/r", number=5, title="t", author="a", state="OPEN",
+        url="u", body="b", diff="d",
+    )
+    monkeypatch.setattr(analyze, "fetch_pr", lambda repo, number: fake_pr)
+    monkeypatch.setattr(
+        analyze, "_iter_llm_stream", lambda *a, **k: iter([("text", "这不是JSON")])
+    )
+    events = list(analyze.analyze_pr_stream("o/r", 5, api_key="sk", model="m"))
+    assert events[-1]["type"] == "error"
+
+
 def test_analyze_pr_assembles_fields(monkeypatch) -> None:
     # 替身：跳过 gh 拉取和真实 LLM 调用
     from pr_learner.fetch import PullRequest

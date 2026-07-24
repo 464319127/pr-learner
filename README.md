@@ -23,8 +23,15 @@ uv run uvicorn pr_learner.api:app --port 8000    # 起服务，浏览器打开 h
 也可用 Docker：
 
 ```bash
-docker compose up --build
+cp .env.example .env          # 首次：填入 GitHub token
+echo "GH_TOKEN=$(gh auth token)" > .env   # 或直接用本机 gh 登录态生成
+docker compose up --build -d
 ```
+
+> Docker 说明：容器内用 `gh` 拉取 PR，需要 GitHub 凭证。镜像已内置 `gh`，
+> token 通过 `.env` 的 `GH_TOKEN` 注入（`.env` 已被 git 忽略，不会提交）。
+> macOS 上 gh 的 token 存在系统钥匙串、不在 `~/.config/gh` 目录，所以必须走
+> `GH_TOKEN`，仅挂载配置目录不够。
 
 > 说明：服务无内置鉴权，仅面向本地/内网。公网暴露需前置网关加访问控制。
 
@@ -52,10 +59,12 @@ uv run uvicorn pr_learner.api:app --port 8000 --reload
 
 ```bash
 git pull
-docker compose up --build -d     # 重新构建镜像并后台重启
+docker compose up --build -d     # 重新构建镜像并后台重启（自动读取 .env 里的 GH_TOKEN）
 docker compose logs -f           # 查看日志
 docker compose down              # 停止
 ```
+
+> token 过期时重新生成 `.env`：`echo "GH_TOKEN=$(gh auth token)" > .env` 再 `docker compose up -d`。
 
 ## 命令行用法
 
