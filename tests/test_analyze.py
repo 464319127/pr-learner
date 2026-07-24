@@ -40,6 +40,19 @@ def test_parse_json_object_bare() -> None:
     assert obj["title"] == "x"
 
 
+def test_build_system_prompt_embeds_output_template() -> None:
+    sp = analyze.build_system_prompt()
+    # 输出模板的字段应被嵌入 system 提示词，且占位符已被替换
+    assert "{output_template}" not in sp
+    assert '"title"' in sp and '"category"' in sp and '"tags"' in sp
+
+
+def test_build_user_prompt_injects_pr_markdown() -> None:
+    up = analyze.build_user_prompt("# PR 内容\ndiff...")
+    assert "{pr_markdown}" not in up
+    assert "# PR 内容" in up
+
+
 def test_analyze_pr_assembles_fields(monkeypatch) -> None:
     # 替身：跳过 gh 拉取和真实 LLM 调用
     from pr_learner.fetch import PullRequest

@@ -46,6 +46,7 @@ docker compose up --build                       # 容器化查询服务
 - `fetch.py` — 唯一与 `gh` 交互的地方。`_run_gh` 以**列表**传参调用 subprocess（不拼接字符串，防注入）。`fetch_pr` 组合三次 gh 调用（`pr view --json`、`pr diff`、`api .../comments`）返回 `PullRequest` dataclass；`to_markdown` 把它渲染成 agent 友好、diff 超长自动截断的 Markdown。
 - `store.py` — 知识持久层。`save_knowledge` 写带 frontmatter 的 Markdown 并触发 `rebuild_index`；`load_all` 扫描整个知识库返回结构化列表，是 query 层的数据源。`_slugify` 保留中文生成文件名。
 - `query.py` — 纯内存检索，构建在 `store.load_all` 之上。关键词/分类/标签之间是 AND 关系。数据量变大时可换 SQLite/全文索引而**保持函数签名不变**。
+- `analyze.py` — 调 LLM 把 PR 分析成知识草稿。**提示词不写死在代码里**，维护在 `prompt_templates/` 目录的纯文本文件：`system_prompt.md`（用 `{output_template}` 占位）、`user_prompt.md`（用 `{pr_markdown}` 占位）、`output_template.json`（期望的 JSON 输出结构）。`build_system_prompt` / `build_user_prompt` 负责读取并填充占位符。用户和 agent 直接编辑这些文件即可调整提示词，无需改代码。改 `output_template.json` 的字段名时须同步 `analyze_pr` 里的 `obj.get(...)` 读取键。
 - `api.py` — FastAPI，薄封装 `query`。知识库目录由环境变量 `PR_LEARNER_KNOWLEDGE_DIR` 覆盖（默认 `./knowledge`）。**服务无内置鉴权**，仅面向本地/内网只读查询；公网暴露需前置网关加访问控制。
 - `cli.py` — Typer 入口，把上述模块串成命令，是 agent 和人的统一操作面。
 
