@@ -1,0 +1,11 @@
+services:
+  knowledge-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # 知识库挂进容器，读写皆可（Web 端记录知识需要写权限）；本地即时可见
+      - ./knowledge:/data/knowledge
+    environment:
+      PR_LEARNER_KNOWLEDGE_DIR: /data/knowledge
+    restart: unless-stopped

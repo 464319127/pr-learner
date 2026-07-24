@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.prompt' | { p=$(cat); case \"$p\" in *'#log'*|*'#记录'*) printf '\\n### %s\\n\\n%s\\n' \"$(date '+%Y-%m-%d %H:%M')\" \"$p\" >> \"$CLAUDE_PROJECT_DIR/prompt.md\";; esac; } 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
