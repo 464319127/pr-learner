@@ -9,12 +9,18 @@
     Authorization: Bearer <api_key>
     {"model": "...", "max_tokens": N, "messages": [{"role":"user","content":"..."}]}
 响应为 Anthropic 格式：{"content": [{"type":"text","text": "..."}]}
+
+提示词维护在 prompt_templates/ 目录下的纯文本文件里，用户和 agent 可直接编辑：
+    system_prompt.md     —— system 提示词，用 {output_template} 占位输出结构
+    user_prompt.md       —— user 提示词，用 {pr_markdown} 占位 PR 内容
+    output_template.json —— 期望的 JSON 输出结构（字段名须与本模块解析一致）
 """
 
 from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import httpx
 
@@ -22,18 +28,26 @@ from pr_learner.fetch import fetch_pr, to_markdown
 
 DEFAULT_BASE_URL = "https://oneapi-comate.baidu-int.com"
 
-_SYSTEM_PROMPT = """你是资深工程师，负责阅读 GitHub PR 并沉淀可复用的知识。
-阅读给定的 PR（描述、diff、评论），提炼出对其他工程师有价值的知识点：\
-根因、设计权衡、易踩的坑、可迁移的教训，而不是流水账式复述改动。
+# 提示词模板目录：随包分发，用户可直接编辑其中的文本文件调整提示词。
+PROMPT_TEMPLATES_DIR = Path(__file__).parent / "prompt_templates"
 
-只返回一个 JSON 对象，不要任何额外解释或 markdown 代码围栏，字段如下：
-{
-  "title": "一句话概括这条知识（不是 PR 标题的照搬）",
-  "category": "简短分类，如 CUDA与量化 / 并发 / 网络 / 构建工程 等",
-  "tags": ["3-6 个小写标签"],
-  "content": "Markdown 正文，分小节讲清根因、机理、修复、可迁移教训"
-}
-正文用中文。"""
+
+def _read_template(name: str) -> str:
+    """读取 prompt_templates/ 下的模板文件内容（去掉首尾空白）。"""
+    return (PROMPT_TEMPLATES_DIR / name).read_text(encoding="utf-8").strip()
+
+
+def build_system_prompt() -> str:
+    """组装 system 提示词：把输出模板嵌入 system_prompt.md 的 {output_template} 占位。"""
+    template = _read_template("system_prompt.md")
+    output_template = _read_template("output_template.json")
+    return template.replace("{output_template}", output_template)
+
+
+def build_user_prompt(pr_markdown: str) -> str:
+    """组装 user 提示词：把 PR Markdown 填入 user_prompt.md 的 {pr_markdown} 占位。"""
+    template = _read_template("user_prompt.md")
+    return template.replace("{pr_markdown}", pr_markdown)
 
 
 class AnalyzeError(RuntimeError):
@@ -46,7 +60,7 @@ def _call_llm(base_url: str, api_key: str, model: str, prompt: str, *, max_token
     payload = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": _SYSTEM_PROMPT,
+        "system": build_system_prompt(),
         "messages": [{"role": "user", "content": prompt}],
     }
     try:
@@ -115,7 +129,7 @@ def analyze_pr(
     """拉取并分析一个 PR，返回草稿字段 dict（title/category/tags/content/source_pr）。"""
     pr = fetch_pr(repo, number)
     pr_md = to_markdown(pr)
-    prompt = f"请阅读以下 PR 并按要求输出知识 JSON：\n\n{pr_md}"
+    prompt = build_user_prompt(pr_md)
 
     raw = _call_llm(base_url, api_key, model, prompt)
     obj = _parse_json_object(raw)
