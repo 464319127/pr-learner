@@ -9,11 +9,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from pr_learner import analyze as analyze_mod
@@ -133,6 +134,53 @@ def analyze(item: AnalyzeIn) -> dict:
         knowledge_dir=KNOWLEDGE_DIR,
     )
     return draft
+
+
+@app.post("/api/analyze/stream")
+def analyze_stream(item: AnalyzeIn) -> StreamingResponse:
+    """流式分析 PR：以 SSE 逐段推送思考过程与模型输出，结束时落库草稿。
+
+    页面用 fetch + ReadableStream 逐行读取，实时滚动展示，让用户看到执行进度。
+    每个 SSE 事件是一行 `data: <json>\\n\\n`，json 的 type 见 analyze.analyze_pr_stream。
+    api_key 仅用于本次请求转发给 LLM，不落盘、不记录。
+    """
+    try:
+        repo, number = analyze_mod.parse_pr_url(item.pr_url)
+    except analyze_mod.AnalyzeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def event_stream():
+        def sse(evt: dict) -> str:
+            return f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+
+        fields = None
+        for evt in analyze_mod.analyze_pr_stream(
+            repo,
+            number,
+            api_key=item.api_key,
+            model=item.model,
+            base_url=item.base_url,
+        ):
+            if evt.get("type") == "result":
+                fields = evt.get("fields")
+                # 落库后把草稿（含 id）作为最终事件推给页面
+                draft = drafts_mod.save_draft(
+                    fields["title"],
+                    fields["category"],
+                    fields["content"],
+                    tags=fields["tags"],
+                    source_pr=fields["source_pr"],
+                    knowledge_dir=KNOWLEDGE_DIR,
+                )
+                yield sse({"type": "done", "draft": draft})
+            else:
+                yield sse(evt)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/drafts")

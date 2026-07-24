@@ -101,6 +101,40 @@ def test_analyze_endpoint_bad_url(tmp_path: Path) -> None:
     assert res.status_code == 400
 
 
+def test_analyze_stream_endpoint(tmp_path: Path, monkeypatch) -> None:
+    """POST /api/analyze/stream：SSE 推送过程事件，结束落库草稿。"""
+    client = _client(tmp_path)
+    import pr_learner.api as api
+
+    def fake_stream(repo, number, **kw):
+        yield {"type": "status", "message": "正在拉取 PR …"}
+        yield {"type": "thinking", "text": "分析 diff"}
+        yield {"type": "text", "text": "正文片段"}
+        yield {
+            "type": "result",
+            "fields": {
+                "title": "流式标题",
+                "category": "网络",
+                "content": "正文",
+                "tags": ["tcp"],
+                "source_pr": f"{repo}#{number}",
+            },
+        }
+
+    monkeypatch.setattr(api.analyze_mod, "analyze_pr_stream", fake_stream)
+    res = client.post(
+        "/api/analyze/stream",
+        json={"pr_url": "https://github.com/o/r/pull/7", "api_key": "sk-x", "model": "m"},
+    )
+    assert res.status_code == 200
+    body = res.text
+    assert "data:" in body
+    assert "thinking" in body
+    assert "done" in body  # result 被转成 done 事件（含落库草稿）
+    # 草稿已落库
+    assert len(client.get("/api/drafts").json()) == 1
+
+
 def test_draft_review_and_approve_flow(tmp_path: Path) -> None:
     """agent 写草稿 → 列出 → 用户修改后 approve → 转正入库、草稿删除。"""
     client = _client(tmp_path)
