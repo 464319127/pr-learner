@@ -60,4 +60,6 @@ docker compose up --build                       # 容器化查询服务
 
 ## 部署
 
-Dockerfile 基于 `uv` 官方镜像，`uv sync --no-dev` 装运行依赖，只跑查询服务。知识库通过卷挂载而非打进镜像，本地更新即时生效。
+Dockerfile 基于 `uv` 官方镜像，`uv sync --no-dev` 装运行依赖，并 apt 安装 `gh`（容器内 `fetch` 拉 PR 需要）。知识库通过卷挂载而非打进镜像，本地更新即时生效。
+
+容器内 `gh` 的 GitHub 凭证通过 `.env` 的 `GH_TOKEN` 注入（compose 自动加载）。**注意**：macOS 上 gh 的 token 存在系统钥匙串而非 `~/.config/gh`，仅只读挂载配置目录不足以让容器登录，必须走 `GH_TOKEN`。生成方式：`echo "GH_TOKEN=$(gh auth token)" > .env`。`.env` 已被 `.gitignore` 忽略，模板见 `.env.example`。
