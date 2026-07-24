@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pr-learner 知识库</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://unpkg.com/marked@12/marked.min.js"></script>
+  <script src="https://unpkg.com/dompurify@3/dist/purify.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #fff; --border: #e3e6ea; --text: #1f2328;
+      --muted: #6b7280; --accent: #2563eb; --accent-soft: #eff4ff; --tag: #eef1f4;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, "PingFang SC", sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    header {
+      background: var(--card); border-bottom: 1px solid var(--border);
+      padding: 1rem 1.5rem;
+    }
+    header h1 { margin: 0; font-size: 1.25rem; }
+    header .sub { color: var(--muted); font-size: .85rem; margin-top: .25rem; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 1.5rem; }
+    .layout { display: grid; grid-template-columns: 220px 1fr; gap: 1.5rem; }
+    @media (max-width: 720px) { .layout { grid-template-columns: 1fr; } }
+    .panel {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1rem;
+    }
+    .cat-item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: .45rem .6rem; border-radius: 6px; cursor: pointer; font-size: .9rem;
+    }
+    .cat-item:hover { background: var(--accent-soft); }
+    .cat-item.active { background: var(--accent); color: #fff; }
+    .cat-item .count { font-size: .75rem; opacity: .8; }
+    .tabs { display: flex; gap: .5rem; margin-bottom: 1rem; }
+    .tab {
+      padding: .45rem .9rem; border: 1px solid var(--border); background: var(--card);
+      border-radius: 8px; cursor: pointer; font-size: .9rem;
+    }
+    .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .badge {
+      display: inline-block; background: #ef4444; color: #fff; border-radius: 999px;
+      font-size: .7rem; padding: 0 .4rem; margin-left: .3rem; vertical-align: top;
+    }
+    .draft-card { margin-bottom: 1.2rem; }
+    .draft-src { color: var(--muted); font-size: .8rem; margin-bottom: .8rem; }
+    .draft-actions { display: flex; gap: .6rem; align-items: center; }
+    button.ghost {
+      background: transparent; color: var(--muted); border: 1px solid var(--border);
+      padding: .55rem 1rem; border-radius: 8px; cursor: pointer; font-size: .9rem;
+    }
+    button.ghost:hover { color: #b91c1c; border-color: #f0b4b4; }
+    .hint { color: var(--muted); font-size: .8rem; margin-top: .8rem; }
+    .searchbar { display: flex; gap: .5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    input, textarea, select {
+      font: inherit; padding: .55rem .7rem; border: 1px solid var(--border);
+      border-radius: 8px; background: var(--card); color: var(--text);
+    }
+    input:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+    .searchbar input { flex: 1; min-width: 160px; }
+    button.primary {
+      background: var(--accent); color: #fff; border: none; padding: .55rem 1.1rem;
+      border-radius: 8px; cursor: pointer; font-size: .9rem;
+    }
+    button.primary:hover { filter: brightness(1.05); }
+    button.primary:disabled { opacity: .5; cursor: not-allowed; }
+    .result {
+      border: 1px solid var(--border); border-radius: 10px; padding: 1rem;
+      margin-bottom: .9rem; background: var(--card);
+    }
+    .result h3 { margin: 0 0 .4rem; font-size: 1.05rem; }
+    .meta { color: var(--muted); font-size: .8rem; margin-bottom: .5rem; }
+    .tag {
+      display: inline-block; background: var(--tag); border-radius: 999px;
+      padding: .1rem .6rem; font-size: .75rem; margin-right: .35rem;
+    }
+    .content-preview {
+      font-size: .88rem; color: #24292f; max-height: 7em;
+      overflow: hidden; position: relative;
+    }
+    .content-preview.open { max-height: none; }
+    /* GitHub 风格的 markdown 渲染 */
+    .markdown-body { line-height: 1.6; }
+    .markdown-body h1, .markdown-body h2, .markdown-body h3 {
+      margin: 1em 0 .5em; line-height: 1.3; font-weight: 600;
+    }
+    .markdown-body h1 { font-size: 1.3rem; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
+    .markdown-body h2 { font-size: 1.15rem; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
+    .markdown-body h3 { font-size: 1rem; }
+    .markdown-body p { margin: .6em 0; }
+    .markdown-body ul, .markdown-body ol { padding-left: 1.5em; margin: .6em 0; }
+    .markdown-body li { margin: .25em 0; }
+    .markdown-body code {
+      background: #eff1f3; border-radius: 4px; padding: .12em .35em;
+      font-family: ui-monospace, SFMono-Regular, monospace; font-size: .85em;
+    }
+    .markdown-body pre {
+      background: #1e1e1e; color: #e6e6e6; border-radius: 8px; padding: .9em 1em;
+      overflow-x: auto; font-size: .82rem;
+    }
+    .markdown-body pre code { background: none; padding: 0; color: inherit; }
+    .markdown-body blockquote {
+      margin: .6em 0; padding: .2em .9em; border-left: 3px solid var(--border); color: var(--muted);
+    }
+    .markdown-body table { border-collapse: collapse; margin: .6em 0; font-size: .85rem; }
+    .markdown-body th, .markdown-body td { border: 1px solid var(--border); padding: .35em .6em; }
+    .markdown-body th { background: #f2f4f6; }
+    .markdown-body a { color: var(--accent); }
+    .toggle { color: var(--accent); cursor: pointer; font-size: .8rem; margin-top: .3rem; display: inline-block; }
+    .empty { color: var(--muted); text-align: center; padding: 2rem; }
+    .form-row { margin-bottom: .8rem; display: flex; flex-direction: column; gap: .3rem; }
+    .form-row label { font-size: .85rem; color: var(--muted); }
+    .form-row textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, monospace; }
+    /* 待审草稿正文：左编辑 / 右预览，滚动联动 */
+    .split-editor {
+      display: grid; grid-template-columns: 1fr 1fr; gap: .75rem;
+      border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    }
+    @media (max-width: 720px) { .split-editor { grid-template-columns: 1fr; } }
+    .split-pane {
+      height: 360px; overflow-y: auto; padding: .7rem .8rem; margin: 0;
+      background: var(--card); border: none; border-radius: 0;
+    }
+    .split-editor textarea.split-pane {
+      resize: none; font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: .82rem; line-height: 1.6; border-right: 1px solid var(--border);
+    }
+    .split-editor textarea.split-pane:focus { outline: none; }
+    .preview-pane { font-size: .88rem; background: #fafbfc; }
+    .toast {
+      position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+      background: #111; color: #fff; padding: .6rem 1.2rem; border-radius: 8px;
+      font-size: .9rem; opacity: .95;
+    }
+    .toast.err { background: #b91c1c; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>📚 pr-learner 知识库</h1>
+      <div class="sub">阅读 PR 沉淀的知识 · 共 {{ totalCount }} 条</div>
+    </header>
+    <div class="wrap">
+      <div class="tabs">
+        <div class="tab" :class="{active: tab==='analyze'}" @click="tab='analyze'">➕ 分析 PR</div>
+        <div class="tab" :class="{active: tab==='search'}" @click="tab='search'">🔍 查询</div>
+        <div class="tab" :class="{active: tab==='review'}" @click="switchReview">
+          📝 待审草稿
+          <span v-if="drafts.length" class="badge">{{ drafts.length }}</span>
+        </div>
+      </div>
+
+      <!-- 分析 PR：用户填 PR 地址 + LLM 凭证，服务端拉取并分析生成草稿 -->
+      <div v-show="tab==='analyze'" class="panel">
+        <div class="form-row">
+          <label>PR 地址 *</label>
+          <input v-model="analyze.pr_url" placeholder="https://github.com/owner/repo/pull/123 或 owner/repo#123">
+        </div>
+        <div class="form-row">
+          <label>LLM 服务 base_url</label>
+          <input v-model="analyze.base_url" placeholder="https://oneapi-comate.baidu-int.com">
+        </div>
+        <div class="form-row">
+          <label>模型 *</label>
+          <input v-model="analyze.model" placeholder="gpt-5.6-sol" list="model-list">
+          <datalist id="model-list">
+            <option value="gpt-5.6-sol"></option>
+            <option value="claude-opus-4-8"></option>
+            <option value="claude-sonnet-5"></option>
+          </datalist>
+        </div>
+        <div class="form-row">
+          <label>API Key *（仅本次请求转发给 LLM，不保存）</label>
+          <input v-model="analyze.api_key" type="password" placeholder="sk-...">
+        </div>
+        <button class="primary" :disabled="!analyzeValid || analyzing" @click="runAnalyze">
+          {{ analyzing ? '分析中，请稍候...' : '开始分析' }}
+        </button>
+        <p class="hint">分析完成后会在「待审草稿」生成一条草稿，你可修改后保存。</p>
+      </div>
+
+      <!-- 查询 -->
+      <div v-show="tab==='search'" class="layout">
+        <aside class="panel">
+          <div class="cat-item" :class="{active: !filterCategory}" @click="selectCategory('')">
+            <span>全部</span><span class="count">{{ totalCount }}</span>
+          </div>
+          <div v-for="(n, c) in categories" :key="c" class="cat-item"
+               :class="{active: filterCategory===c}" @click="selectCategory(c)">
+            <span>{{ c }}</span><span class="count">{{ n }}</span>
+          </div>
+        </aside>
+        <main>
+          <div class="searchbar">
+            <input v-model="keyword" placeholder="关键词（标题或正文）" @keyup.enter="doSearch">
+            <input v-model="tag" placeholder="标签" @keyup.enter="doSearch">
+            <button class="primary" @click="doSearch">搜索</button>
+          </div>
+          <div v-if="results.length === 0" class="empty">没有匹配的知识</div>
+          <div v-for="r in results" :key="r.path" class="result">
+            <h3>{{ r.title }}</h3>
+            <div class="meta">
+              分类 {{ r.category }}
+              <template v-if="r.source_pr">· 来源 {{ r.source_pr }}</template>
+              <template v-if="r.date">· {{ r.date }}</template>
+            </div>
+            <div>
+              <span v-for="t in r.tags" :key="t" class="tag">{{ t }}</span>
+            </div>
+            <div class="markdown-body content-preview" :class="{open: r._open}" v-html="renderMd(r.content)"></div>
+            <span class="toggle" @click="r._open = !r._open">
+              {{ r._open ? '收起' : '展开全文' }}
+            </span>
+          </div>
+        </main>
+      </div>
+
+      <!-- 待审草稿：agent 分析 PR 生成，用户 review 后保存 -->
+      <div v-show="tab==='review'">
+        <p v-if="drafts.length === 0" class="empty">
+          暂无待审草稿。<br>
+          把 PR 地址发给 agent，分析完会在这里生成草稿供你 review。
+        </p>
+        <div v-for="d in drafts" :key="d.id" class="panel draft-card">
+          <div class="draft-src">来源 {{ d.source_pr || '（未填）' }} · 草稿 {{ d.id }} · {{ d.created_at }}</div>
+          <div class="form-row">
+            <label>标题 *</label>
+            <input v-model="d.title">
+          </div>
+          <div class="form-row">
+            <label>分类 *</label>
+            <input v-model="d.category" list="cat-list">
+            <datalist id="cat-list">
+              <option v-for="(n, c) in categories" :key="c" :value="c"></option>
+            </datalist>
+          </div>
+          <div class="form-row">
+            <label>来源 PR</label>
+            <input v-model="d.source_pr" placeholder="owner/repo#123">
+          </div>
+          <div class="form-row">
+            <label>标签（逗号分隔）</label>
+            <input v-model="d.tagsRaw">
+          </div>
+          <div class="form-row">
+            <label>正文（Markdown）* — 左侧编辑，右侧实时预览</label>
+            <div class="split-editor">
+              <textarea class="split-pane" v-model="d.content"
+                        :ref="'ta-' + d.id"
+                        @scroll="syncScroll($event, d.id)"></textarea>
+              <div class="split-pane markdown-body preview-pane"
+                   :ref="'pv-' + d.id"
+                   v-html="renderMd(d.content)"></div>
+            </div>
+          </div>
+          <div class="draft-actions">
+            <button class="primary" :disabled="!draftValid(d) || d._saving" @click="approve(d)">
+              {{ d._saving ? '保存中...' : '✓ 保存知识' }}
+            </button>
+            <button class="ghost" @click="discard(d)">丢弃</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div v-if="toast" class="toast" :class="{err: toastErr}">{{ toast }}</div>
+  </div>
+
+  <script>
+    const { createApp } = Vue;
+    createApp({
+      data() {
+        return {
+          tab: 'analyze',
+          categories: {},
+          results: [],
+          drafts: [],
+          keyword: '', tag: '', filterCategory: '',
+          analyze: { pr_url: '', base_url: 'https://oneapi-comate.baidu-int.com', model: 'gpt-5.6-sol', api_key: '' },
+          analyzing: false,
+          toast: '', toastErr: false,
+        };
+      },
+      computed: {
+        totalCount() { return Object.values(this.categories).reduce((a, b) => a + b, 0); },
+        analyzeValid() {
+          return this.analyze.pr_url && this.analyze.model && this.analyze.api_key;
+        },
+      },
+      methods: {
+        async loadCategories() {
+          this.categories = await (await fetch('/api/categories')).json();
+        },
+        async loadDrafts() {
+          const data = await (await fetch('/api/drafts')).json();
+          // 把 tags 数组摊平成逗号字符串供编辑
+          this.drafts = data.map(d => ({
+            ...d,
+            tagsRaw: (d.tags || []).join(', '),
+            _saving: false,
+          }));
+        },
+        switchReview() { this.tab = 'review'; this.loadDrafts(); },
+        draftValid(d) { return d.title && d.category && d.content; },
+        renderMd(text) {
+          // marked 渲染 + DOMPurify 消毒，防止知识正文里的 HTML/脚本注入
+          return DOMPurify.sanitize(marked.parse(text || ''));
+        },
+        syncScroll(evt, id) {
+          // 编辑区滚动时，预览区按相同比例跟随滚动
+          const src = evt.target;
+          const pv = this.$refs['pv-' + id];
+          const dst = Array.isArray(pv) ? pv[0] : pv;
+          if (!dst) return;
+          const denom = src.scrollHeight - src.clientHeight;
+          const ratio = denom > 0 ? src.scrollTop / denom : 0;
+          dst.scrollTop = ratio * (dst.scrollHeight - dst.clientHeight);
+        },
+        async runAnalyze() {
+          if (!this.analyzeValid) return;
+          this.analyzing = true;
+          try {
+            const res = await fetch('/api/analyze', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(this.analyze),
+            });
+            if (!res.ok) {
+              const e = await res.json().catch(() => ({}));
+              throw new Error(e.detail || res.status);
+            }
+            this.showToast('分析完成，已生成草稿');
+            this.analyze.pr_url = '';
+            await this.loadDrafts();
+            this.tab = 'review';
+          } catch (e) {
+            this.showToast('分析失败: ' + e.message, true);
+          } finally {
+            this.analyzing = false;
+          }
+        },
+        async doSearch() {
+          const p = new URLSearchParams();
+          if (this.keyword) p.set('keyword', this.keyword);
+          if (this.tag) p.set('tag', this.tag);
+          if (this.filterCategory) p.set('category', this.filterCategory);
+          const data = await (await fetch('/api/search?' + p)).json();
+          this.results = data.map(r => ({ ...r, _open: false }));
+        },
+        selectCategory(c) { this.filterCategory = c; this.doSearch(); },
+        showToast(msg, err = false) {
+          this.toast = msg; this.toastErr = err;
+          setTimeout(() => { this.toast = ''; }, 2500);
+        },
+        async approve(d) {
+          if (!this.draftValid(d)) return;
+          d._saving = true;
+          try {
+            const body = {
+              title: d.title, category: d.category, content: d.content,
+              source_pr: d.source_pr,
+              tags: d.tagsRaw.split(',').map(s => s.trim()).filter(Boolean),
+            };
+            const res = await fetch('/api/drafts/' + d.id + '/approve', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            if (!res.ok) {
+              const e = await res.json().catch(() => ({}));
+              throw new Error(e.detail || res.status);
+            }
+            const out = await res.json();
+            this.showToast('已保存: ' + out.path);
+            await this.loadDrafts();
+            await this.loadCategories();
+          } catch (e) {
+            this.showToast('保存失败: ' + e.message, true);
+          } finally {
+            d._saving = false;
+          }
+        },
+        async discard(d) {
+          if (!confirm('确定丢弃这条草稿？')) return;
+          await fetch('/api/drafts/' + d.id, { method: 'DELETE' });
+          this.showToast('已丢弃草稿');
+          await this.loadDrafts();
+        },
+      },
+      async mounted() {
+        await this.loadCategories();
+        await this.loadDrafts();
+        await this.doSearch();
+        // 有草稿时默认停在 review 页，否则从分析页开始
+        if (this.drafts.length) this.tab = 'review';
+      },
+    }).mount('#app');
+  </script>
+</body>
+</html>

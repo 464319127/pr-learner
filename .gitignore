@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+uv.lock
+dist/
+build/
+*.egg-info/
+
+# 测试/工具
+.pytest_cache/
+.ruff_cache/
+
+# 环境
+.env
+
+# Claude Code 个人本地配置（通用配置 settings.json 仍提交）
+.claude/settings.local.json
+
+# 知识库草稿（未审内容，不提交）
+knowledge/.drafts/

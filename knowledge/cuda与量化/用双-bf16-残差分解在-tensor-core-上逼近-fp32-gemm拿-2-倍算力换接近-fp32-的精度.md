@@ -1,0 +1,51 @@
+---
+category: CUDA与量化
+date: '2026-07-24'
+source_pr: Tencent/hpc-ops#47
+tags:
+- cuda
+- tensor-core
+- gemm
+- bf16
+- sm90
+- splitk
+title: 用双 BF16 残差分解在 Tensor Core 上逼近 FP32 GEMM：拿 2 倍算力换接近 FP32 的精度
+---
+
+## 根因：精度与吞吐的两难
+
+LLM 推理里 BF16 激活 × FP32 权重的 GEMM 有个尴尬处境：直接用 FP32 走 CUDA Core 精度够但吞吐低（H20/SM90 上 Tensor Core 才是算力主力）；退化成 BF16/TF32 能吃到 Tensor Core，但 BF16 只有 7 位尾数，权重精度损失严重。这个 PR 的核心是既要 Tensor Core 的速度，又要接近 FP32 的精度。
+
+## 机理：残差分解成两个 BF16 GEMM
+
+把 FP32 权重 W 拆成高位和低位残差两部分：
+
+```
+w_high = W.to(bf16)                      # 截断到 bf16，丢掉低位
+w_low  = ((W - w_high.float()) / scale).to(bf16)   # 残差放大后再存成 bf16
+scale  = 1/256
+```
+
+于是 `X @ W ≈ X @ w_high + scale * (X @ w_low)`。两次 BF16 矩阵乘都能跑在 Tensor Core 上，结果按 `y = y_low * scale + y_high` 线性组合。
+
+关键点是 scale=1/256=2^-8：残差本身数值很小，若直接存 bf16 会落到指数下溢/尾数无效区，先乘 256 把残差搬回 bf16 有效表示范围，累加时再乘回 1/256。等效于把权重的有效尾数位数从 7 位扩展到约 14~15 位，逼近 FP32 的 23 位里对结果贡献最大的部分。测试用 `rtol=0.08, atol=0.01`、benchmark 用 `max_abs<0.01` 校验，说明这是「接近」而非「等价」FP32。
+
+## 实现上的工程要点
+
+- **单 kernel 融合两次 GEMM**：不是发两个 cuBLAS 调用再相加，而是在一个 SM90 kernel 里对同一批 X/权重 tile 连续做 low、high 两次 warpgroup MMA，累加器分别是 `tYr_low`/`tYr_high`，epilogue 才做 `low*scale+high`。这样 X 只从 HBM/共享内存读一次，两次 MMA 复用同一份激活，避免了 X 的重复搬运。
+- **生产者-消费者 warpgroup 分工**：用一个 load warpgroup（`warpgroup_reg_dealloc<24>` 降寄存器）专门跑 TMA 异步搬运，多个 math warpgroup（`reg_alloc<168>`）跑 MMA，通过 mbarrier 的 readable/writable 双组屏障 + phase 翻转做多 stage 流水，典型的 Hopper TMA+WGMMA 软件流水线写法。
+- **形状自适应调度**：`normalized_m` 把任意 (m,n,k) 归一化到参考形状 N=192/K=4096 的等效 m，再据此选 splitk（8/4/2/1）、kTileM（16 用于小 m、64 用于大 m）和 warpgroup_n。小 m 场景 K 维很长而输出很小，靠 split-K 把 K 切块喂满 SM；大 m 则不切 K。这套阈值是针对特定形状 sweep 调出来的经验表。
+
+## 易踩的坑
+
+- **残差不缩放会失效**：如果省掉 scale 直接 `(W-w_high).to(bf16)`，小残差会因 bf16 动态范围不足而大量归零，等于白做第二次 GEMM。scale 的选取要匹配残差的量级。
+- **split-K 的跨 CTA 归约同步**：多个 CTA 各算部分 K 的结果写到 `splitk_y`，用 `split_flag` 原子计数 + `load_global_volatile` 自旋等待所有 chunk 完成才做 reduce。这里必须配 `fence.proxy.async.global` + `__threadfence()`，因为 TMA store 走 async proxy，普通线程读该内存前要跨 proxy 做可见性 fence，否则会读到未落地的部分和。这是 Hopper 异步内存模型的典型陷阱。
+- **split_flag 复用要清零**：flag 作为可复用 workspace 传入，reduce 完必须重置回 0（kernel 里 `*split_flag=0`，测试里 `assert (split_flag==0).all()`），否则下次调用计数错乱。
+- **benchmark 计时方法学**：默认用 nsys NVTX GPU projected duration 而非 CUDA event，且计时步内不 synchronize，起单独 worker 子进程 profile。这是为了避免 event 同步开销和 CPU launch 抖动污染 kernel 真实耗时——小 kernel 场景下 event 计时的相对误差会很大。
+
+## 可迁移的教训
+
+- 「双精度分解 + 低精度硬件」是通用套路：想在只有低精度矩阵单元的硬件上逼近高精度，可以把高精度数拆成多个低精度分量做多次乘累加（同类思想见 float-float、TF32 三次分解、以及 Ozaki scheme）。代价是算力翻倍（这里 2 倍 MMA），换取尾数位翻倍。
+- 分解时务必给小分量做缩放，让它落在目标低精度类型的有效表示区间，这是精度能否兑现的前提。
+- 在 Hopper 上做 split-K 或任何跨 CTA/跨 proxy 的数据共享，async proxy 的 fence 语义要单独处理，普通 `__threadfence` 不覆盖 TMA 异步写的可见性。
+- 手写 kernel 的形状调度表是过拟合参考形状的经验值，迁移到新形状/新硬件前应重新 sweep 标定，不能当作普适最优。
