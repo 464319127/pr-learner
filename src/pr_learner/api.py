@@ -18,14 +18,22 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from pr_learner import analyze as analyze_mod
+from pr_learner import discover as discover_mod
 from pr_learner import drafts as drafts_mod
 from pr_learner import query as q
 from pr_learner import store
+from pr_learner.fetch import GhError
+from pr_learner.llm import LlmError
 
 KNOWLEDGE_DIR = Path(os.environ.get("PR_LEARNER_KNOWLEDGE_DIR", "knowledge"))
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="pr-learner 知识查询", version="0.1.0")
+
+
+def _sse(evt: dict) -> str:
+    """把一个事件 dict 编码成一行 SSE。"""
+    return f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
 
 
 class KnowledgeIn(BaseModel):
@@ -54,6 +62,26 @@ class AnalyzeIn(BaseModel):
     pr_url: str = Field(..., min_length=1, description="PR 链接或 owner/repo#123")
     api_key: str = Field(..., min_length=1, description="LLM API Key")
     model: str = Field(..., min_length=1, description="模型名")
+    base_url: str = Field(
+        default=analyze_mod.DEFAULT_BASE_URL, description="LLM 服务 base_url"
+    )
+
+
+class PrDiscoverIn(BaseModel):
+    """页面提交 PR 查找请求：关键词 + 仓库名 + LLM 凭证。
+
+    api_key 留空时降级为纯 gh 搜索（不调模型），但中文关键词在这种模式下
+    大概率搜不到——GitHub 不索引中文。
+    """
+
+    keyword: str = Field(default="", description="自然语言关键词，可中文")
+    repo: str = Field(default="", description="owner/name 格式的仓库")
+    limit: int = Field(default=20, ge=1, le=100, description="最多返回条数")
+    state: str | None = Field(
+        default=None, description="open / merged / closed（closed 指已关闭未合并）"
+    )
+    api_key: str = Field(default="", description="LLM API Key，留空则不调模型")
+    model: str = Field(default="", description="模型名")
     base_url: str = Field(
         default=analyze_mod.DEFAULT_BASE_URL, description="LLM 服务 base_url"
     )
@@ -122,6 +150,8 @@ def analyze(item: AnalyzeIn) -> dict:
             model=item.model,
             base_url=item.base_url,
         )
+    except GhError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except analyze_mod.AnalyzeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -150,9 +180,6 @@ def analyze_stream(item: AnalyzeIn) -> StreamingResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     def event_stream():
-        def sse(evt: dict) -> str:
-            return f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
-
         fields = None
         for evt in analyze_mod.analyze_pr_stream(
             repo,
@@ -172,9 +199,64 @@ def analyze_stream(item: AnalyzeIn) -> StreamingResponse:
                     source_pr=fields["source_pr"],
                     knowledge_dir=KNOWLEDGE_DIR,
                 )
-                yield sse({"type": "done", "draft": draft})
+                yield _sse({"type": "done", "draft": draft})
             else:
-                yield sse(evt)
+                yield _sse(evt)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# --- 查找 PR：关键词 + 仓库名 → LLM 生成查询、gh 搜索、LLM 筛选排序 ---
+
+
+@app.post("/api/discover/prs")
+def discover_prs(item: PrDiscoverIn) -> dict:
+    """一次性查找 PR，返回 {"query","warning","results"}。给 CLI/脚本用。
+
+    api_key 仅用于本次请求转发给 LLM 服务，不落盘、不记录。
+    """
+    if not item.keyword.strip() and not item.repo.strip():
+        raise HTTPException(status_code=400, detail="请至少填写关键词或仓库名")
+    try:
+        return discover_mod.discover_prs(
+            item.keyword,
+            item.repo,
+            api_key=item.api_key,
+            model=item.model,
+            base_url=item.base_url,
+            limit=item.limit,
+            state=item.state,
+        )
+    except GhError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LlmError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/discover/prs/stream")
+def discover_prs_stream(item: PrDiscoverIn) -> StreamingResponse:
+    """流式查找 PR：SSE 逐段推送生成的查询、候选数、模型筛选过程与最终列表。
+
+    事件类型见 discover.discover_prs_stream。api_key 不落盘、不记录。
+    """
+    if not item.keyword.strip() and not item.repo.strip():
+        raise HTTPException(status_code=400, detail="请至少填写关键词或仓库名")
+
+    def event_stream():
+        for evt in discover_mod.discover_prs_stream(
+            item.keyword,
+            item.repo,
+            api_key=item.api_key,
+            model=item.model,
+            base_url=item.base_url,
+            limit=item.limit,
+            state=item.state,
+        ):
+            yield _sse(evt)
 
     return StreamingResponse(
         event_stream(),
