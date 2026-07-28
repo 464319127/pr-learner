@@ -170,6 +170,50 @@
       font-size: .9rem; opacity: .95;
     }
     .toast.err { background: #b91c1c; }
+    /* 查找 PR 的结果卡片 */
+    .pr-card { border: 1px solid var(--border); border-radius: 10px; padding: .9rem 1rem;
+      margin-bottom: .8rem; background: var(--card); }
+    .pr-card h3 { margin: 0 0 .35rem; font-size: 1rem; line-height: 1.4; }
+    .pr-card h3 a { color: var(--text); text-decoration: none; }
+    .pr-card h3 a:hover { color: var(--accent); text-decoration: underline; }
+    .pr-summary { font-size: .88rem; margin: .5rem 0; }
+    .pr-excerpt { font-size: .82rem; color: var(--muted); margin: .5rem 0;
+      max-height: 3.4em; overflow: hidden; }
+    .pr-actions { display: flex; gap: .5rem; align-items: center; margin-top: .6rem; }
+    .pr-actions a.btn, .pr-actions button {
+      font: inherit; font-size: .82rem; padding: .35rem .8rem; border-radius: 6px;
+      cursor: pointer; text-decoration: none; border: 1px solid var(--border);
+      background: var(--card); color: var(--text);
+    }
+    .pr-actions a.btn:hover, .pr-actions button:hover { border-color: var(--accent); color: var(--accent); }
+    .pr-actions button.go { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .pr-actions button.go:hover { color: #fff; filter: brightness(1.05); }
+    .pr-actions button:disabled { opacity: .5; cursor: not-allowed; }
+    .rel { display: inline-block; border-radius: 999px; padding: .05rem .5rem;
+      font-size: .72rem; margin-left: .4rem; vertical-align: middle; }
+    .rel-高 { background: #dcfce7; color: #15803d; }
+    .rel-中 { background: #fef3c7; color: #a16207; }
+    .rel-低 { background: var(--tag); color: var(--muted); }
+    .st-open { color: #15803d; } .st-merged { color: #7c3aed; } .st-closed { color: #b91c1c; }
+    .query-box {
+      font-family: ui-monospace, SFMono-Regular, monospace; font-size: .82rem;
+      background: var(--accent-soft); border: 1px solid #cfdcfb; border-radius: 6px;
+      padding: .4rem .7rem; margin-bottom: .9rem; word-break: break-all;
+    }
+    /* 结果列表的排序条 */
+    .sortbar {
+      display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+      margin-bottom: .8rem; font-size: .82rem; color: var(--muted);
+    }
+    .sortbar select { font-size: .82rem; padding: .3rem .5rem; }
+    .sortbar-label { font-weight: 500; }
+    .sortbar-hint { font-size: .76rem; }
+    button.sort-dir {
+      font: inherit; font-size: .82rem; padding: .3rem .7rem; border-radius: 6px;
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+      cursor: pointer;
+    }
+    button.sort-dir:hover { border-color: var(--accent); color: var(--accent); }
   </style>
 </head>
 <body>
@@ -180,27 +224,24 @@
     </header>
     <div class="wrap">
       <div class="tabs">
+        <div class="tab" :class="{active: tab==='discover'}" @click="tab='discover'">🔎 查找 PR</div>
         <div class="tab" :class="{active: tab==='analyze'}" @click="tab='analyze'">➕ 分析 PR</div>
-        <div class="tab" :class="{active: tab==='search'}" @click="tab='search'">🔍 查询</div>
+        <div class="tab" :class="{active: tab==='search'}" @click="tab='search'">🔍 查询知识</div>
         <div class="tab" :class="{active: tab==='review'}" @click="switchReview">
           📝 待审草稿
           <span v-if="drafts.length" class="badge">{{ drafts.length }}</span>
         </div>
       </div>
 
-      <!-- 分析 PR：用户填 PR 地址 + LLM 凭证，服务端拉取并分析生成草稿 -->
-      <div v-show="tab==='analyze'" class="panel">
-        <div class="form-row">
-          <label>PR 地址 *</label>
-          <input v-model="analyze.pr_url" placeholder="https://github.com/owner/repo/pull/123 或 owner/repo#123">
-        </div>
+      <!-- LLM 凭证：分析 PR 与查找 PR 共用一份，仅本次请求转发，不保存 -->
+      <div v-show="tab==='analyze' || tab==='discover'" class="panel" style="margin-bottom:1rem">
         <div class="form-row">
           <label>LLM 服务 base_url</label>
-          <input v-model="analyze.base_url" placeholder="https://oneapi-comate.baidu-int.com">
+          <input v-model="llm.base_url" placeholder="https://oneapi-comate.baidu-int.com">
         </div>
         <div class="form-row">
           <label>模型 *</label>
-          <input v-model="analyze.model" placeholder="gpt-5.6-sol" list="model-list">
+          <input v-model="llm.model" placeholder="gpt-5.6-sol" list="model-list">
           <datalist id="model-list">
             <option value="gpt-5.6-sol"></option>
             <option value="claude-opus-4-8"></option>
@@ -208,8 +249,114 @@
           </datalist>
         </div>
         <div class="form-row">
-          <label>API Key *（仅本次请求转发给 LLM，不保存）</label>
-          <input v-model="analyze.api_key" type="password" placeholder="sk-...">
+          <label>API Key *（仅本次请求转发给 LLM，不保存、不落盘）</label>
+          <input v-model="llm.api_key" type="password" placeholder="sk-...">
+        </div>
+      </div>
+
+      <!-- 查找 PR：LLM 把关键词翻成 GitHub 搜索语法 → gh 搜索 → LLM 筛选排序写简介 -->
+      <div v-show="tab==='discover'" class="panel">
+        <div class="form-row">
+          <label>关键词 *（可用中文，会由模型翻成 GitHub 搜索语法）</label>
+          <input v-model="discover.keyword" placeholder="例如：hicache 的内存泄漏问题"
+                 @keyup.enter="runDiscover">
+        </div>
+        <div class="form-row">
+          <label>仓库 *</label>
+          <input v-model="discover.repo" placeholder="owner/name，例如 sgl-project/sglang"
+                 @keyup.enter="runDiscover">
+        </div>
+        <div class="form-row">
+          <label>状态 / 条数</label>
+          <div style="display:flex; gap:.5rem;">
+            <select v-model="discover.state">
+              <option :value="null">全部状态</option>
+              <option value="merged">仅已合并</option>
+              <option value="open">仅未关闭</option>
+              <option value="closed">已关闭未合并</option>
+            </select>
+            <input v-model.number="discover.limit" type="number" min="1" max="100" style="width:6rem">
+          </div>
+        </div>
+        <button class="primary" :disabled="!discoverValid || discovering" @click="runDiscover">
+          {{ discovering ? '查找中...' : '查找 PR' }}
+        </button>
+        <p class="hint">
+          选了状态就以下拉框为准，关键词里矛盾的 <code>is:merged</code> 之类会被忽略。
+          GitHub 搜索只索引 PR 的标题、描述和评论，<strong>不索引 diff</strong>，
+          所以「哪个 PR 改了某个函数」这类问题可能找不到。
+        </p>
+
+        <!-- 查找过程：翻译查询、搜索、模型筛选，随流式返回滚动 -->
+        <div v-if="discovering || discoverLog.length" class="stream-box">
+          <div class="stream-head">
+            <span class="stream-title">查找过程</span>
+            <span v-if="discovering" class="stream-live">● 进行中</span>
+            <span class="stream-toggle" @click="autoScroll = !autoScroll">
+              {{ autoScroll ? '自动滚动:开' : '自动滚动:关' }}
+            </span>
+          </div>
+          <div class="stream-body" ref="discoverStreamBody">
+            <div v-for="(ln, i) in discoverLog" :key="i" class="stream-line" :class="'st-' + ln.kind">
+              <span v-if="ln.kind==='status'" class="st-tag">·</span>
+              <span v-else-if="ln.kind==='thinking'" class="st-tag">思考</span>
+              <span v-else-if="ln.kind==='error'" class="st-tag">✕</span>
+              <span class="st-text">{{ ln.text }}</span>
+            </div>
+            <span v-if="discovering" class="cursor">▋</span>
+          </div>
+        </div>
+
+        <div v-if="usedQuery" class="query-box" style="margin-top:1rem">
+          实际搜索语法：{{ usedQuery }}
+        </div>
+        <div v-if="prResults.length" style="margin-top:.5rem">
+          <div class="sortbar">
+            <span class="sortbar-label">共 {{ prResults.length }} 条 · 排序</span>
+            <select v-model="sortBy">
+              <option value="relevance">{{ modelRanked ? '价值（模型排序）' : '搜索相关度' }}</option>
+              <option value="created">创建时间</option>
+              <option value="updated">更新时间</option>
+            </select>
+            <button v-if="sortBy !== 'relevance'" class="sort-dir" @click="sortDesc = !sortDesc">
+              {{ sortDesc ? '↓ 由新到旧' : '↑ 由旧到新' }}
+            </button>
+            <span v-if="sortBy !== 'relevance'" class="sortbar-hint">
+              仅重排已搜到的这 {{ prResults.length }} 条，不代表全仓库最新
+            </span>
+          </div>
+          <div v-for="p in sortedResults" :key="p.url" class="pr-card">
+            <h3>
+              <a :href="p.url" target="_blank" rel="noopener noreferrer">{{ p.title }}</a>
+              <span v-if="p.relevance" class="rel" :class="'rel-' + p.relevance">{{ p.relevance }}</span>
+            </h3>
+            <div class="meta">
+              {{ p.repo }}#{{ p.number }}
+              · <span :class="'st-' + p.state">{{ p.state }}</span>
+              <template v-if="p.is_draft">· draft</template>
+              <template v-if="p.author">· {{ p.author }}</template>
+              <template v-if="p.created_at">· 创建于 {{ p.created_at }}</template>
+              <template v-if="p.updated_at">· 更新于 {{ p.updated_at }}</template>
+            </div>
+            <div v-if="p.labels && p.labels.length">
+              <span v-for="l in p.labels" :key="l" class="tag">{{ l }}</span>
+            </div>
+            <div v-if="p.summary" class="pr-summary">{{ p.summary }}</div>
+            <div v-else-if="p.excerpt" class="pr-excerpt">{{ p.excerpt }}</div>
+            <div class="pr-actions">
+              <a class="btn" :href="p.url" target="_blank" rel="noopener noreferrer">打开 PR ↗</a>
+              <button class="go" :disabled="analyzing" @click="analyzeThis(p)">分析此 PR</button>
+            </div>
+          </div>
+        </div>
+        <div v-else-if="discoverDone" class="empty">没有找到相关 PR，换个关键词试试</div>
+      </div>
+
+      <!-- 分析 PR：用户填 PR 地址，服务端拉取并分析生成草稿 -->
+      <div v-show="tab==='analyze'" class="panel">
+        <div class="form-row">
+          <label>PR 地址 *</label>
+          <input v-model="analyze.pr_url" placeholder="https://github.com/owner/repo/pull/123 或 owner/repo#123">
         </div>
         <button class="primary" :disabled="!analyzeValid || analyzing" @click="runAnalyze">
           {{ analyzing ? '分析中，请稍候...' : '开始分析' }}
@@ -225,7 +372,7 @@
               {{ autoScroll ? '自动滚动:开' : '自动滚动:关' }}
             </span>
           </div>
-          <div class="stream-body" ref="streamBody">
+          <div class="stream-body" ref="analyzeStreamBody">
             <div v-for="(ln, i) in analyzeLog" :key="i" class="stream-line" :class="'st-' + ln.kind">
               <span v-if="ln.kind==='status'" class="st-tag">·</span>
               <span v-else-if="ln.kind==='thinking'" class="st-tag">思考</span>
@@ -328,22 +475,50 @@
     createApp({
       data() {
         return {
-          tab: 'analyze',
+          tab: 'discover',
           categories: {},
           results: [],
           drafts: [],
           keyword: '', tag: '', filterCategory: '',
-          analyze: { pr_url: '', base_url: 'https://oneapi-comate.baidu-int.com', model: 'gpt-5.6-sol', api_key: '' },
+          // LLM 凭证：分析 PR 与查找 PR 共用。刻意只放在内存里，不落 localStorage。
+          llm: { base_url: 'https://oneapi-comate.baidu-int.com', model: 'gpt-5.6-sol', api_key: '' },
+          analyze: { pr_url: '' },
           analyzing: false,
           analyzeLog: [],   // 流式执行过程：[{kind, text}]，kind ∈ status/thinking/text/error
+          discover: { keyword: '', repo: '', limit: 20, state: null },
+          discovering: false,
+          discoverLog: [],
+          discoverDone: false,
+          prResults: [],
+          usedQuery: '',
+          // 结果排序：relevance 用后端给的顺序（模型排的价值），其余按日期排
+          sortBy: 'relevance',
+          sortDesc: true,
           autoScroll: true,
           toast: '', toastErr: false,
         };
       },
       computed: {
         totalCount() { return Object.values(this.categories).reduce((a, b) => a + b, 0); },
-        analyzeValid() {
-          return this.analyze.pr_url && this.analyze.model && this.analyze.api_key;
+        llmValid() { return this.llm.model && this.llm.api_key; },
+        analyzeValid() { return this.analyze.pr_url && this.llmValid; },
+        discoverValid() { return this.discover.keyword && this.discover.repo; },
+        // 有 summary 说明模型真的筛选排序过；无 key 或模型失败时是 gh 的原始顺序
+        modelRanked() { return this.prResults.some(p => p.summary); },
+        // 前端重排，不重新请求：这批候选已经在手上，按日期排不需要再花一次搜索限额
+        sortedResults() {
+          if (this.sortBy === 'relevance') return this.prResults;
+          const key = this.sortBy === 'created' ? 'created_at' : 'updated_at';
+          const dir = this.sortDesc ? -1 : 1;
+          // 日期是 YYYY-MM-DD，字符串比较即字典序＝时间序；缺失的一律沉底（两个方向都沉底，
+          // 所以在 dir 之前 return，不参与方向翻转）
+          return [...this.prResults].sort((a, b) => {
+            const x = a[key] || '', y = b[key] || '';
+            if (!x && !y) return 0;
+            if (!x) return 1;
+            if (!y) return -1;
+            return (x < y ? -1 : x > y ? 1 : 0) * dir;
+          });
         },
       },
       methods: {
@@ -376,29 +551,70 @@
           dst.scrollTop = ratio * (dst.scrollHeight - dst.clientHeight);
         },
         async runAnalyze() {
-          if (!this.analyzeValid) return;
+          if (!this.analyzeValid || this.analyzing) return;
           this.analyzing = true;
           this.analyzeLog = [];
           try {
+            // 显式组装请求体：凭证已挪到 this.llm，直接 stringify(this.analyze) 会缺字段被 422
             const res = await fetch('/api/analyze/stream', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(this.analyze),
+              body: JSON.stringify({ pr_url: this.analyze.pr_url, ...this.llm }),
             });
             if (!res.ok || !res.body) {
               const e = await res.json().catch(() => ({}));
               throw new Error(e.detail || res.status);
             }
-            await this.consumeStream(res.body);
+            await this.consumeStream(res.body, this.handleAnalyzeEvent);
           } catch (e) {
-            this.pushLog('error', '分析失败: ' + e.message);
+            this.pushLog(this.analyzeLog, 'error', '分析失败: ' + e.message, 'analyzeStreamBody');
             this.showToast('分析失败: ' + e.message, true);
           } finally {
             this.analyzing = false;
           }
         },
-        // 逐行解析 SSE，按事件类型驱动执行过程展示
-        async consumeStream(body) {
+        async runDiscover() {
+          if (!this.discoverValid || this.discovering) return;
+          this.discovering = true;
+          this.discoverDone = false;
+          this.discoverLog = [];
+          this.prResults = [];
+          this.usedQuery = '';
+          try {
+            const res = await fetch('/api/discover/prs/stream', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ...this.discover, ...this.llm }),
+            });
+            if (!res.ok || !res.body) {
+              const e = await res.json().catch(() => ({}));
+              throw new Error(e.detail || res.status);
+            }
+            await this.consumeStream(res.body, this.handleDiscoverEvent);
+          } catch (e) {
+            this.pushLog(this.discoverLog, 'error', '查找失败: ' + e.message, 'discoverStreamBody');
+            this.showToast('查找失败: ' + e.message, true);
+          } finally {
+            this.discovering = false;
+            this.discoverDone = true;
+          }
+        },
+        // 从查找结果直接跳去分析：填入地址、切 tab，凭证齐全就自动开跑
+        analyzeThis(p) {
+          if (this.analyzing) {
+            this.showToast('已有分析在进行中，请稍候', true);
+            return;
+          }
+          this.analyze.pr_url = p.url;
+          this.tab = 'analyze';
+          if (this.llmValid) {
+            this.runAnalyze();
+          } else {
+            this.showToast('请先填写模型和 API Key', true);
+          }
+        },
+        // 逐行解析 SSE，把事件交给调用方给的 handler
+        async consumeStream(body, onEvent) {
           const reader = body.getReader();
           const decoder = new TextDecoder();
           let buf = '';
@@ -414,22 +630,22 @@
               if (!line) continue;
               let evt;
               try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
-              this.handleStreamEvent(evt);
+              onEvent(evt);
             }
           }
         },
-        handleStreamEvent(evt) {
+        handleAnalyzeEvent(evt) {
+          const log = this.analyzeLog;
+          const box = 'analyzeStreamBody';
           if (evt.type === 'status') {
-            this.pushLog('status', evt.message);
-          } else if (evt.type === 'thinking') {
-            this.appendLog('thinking', evt.text);
-          } else if (evt.type === 'text') {
-            this.appendLog('text', evt.text);
+            this.pushLog(log, 'status', evt.message, box);
+          } else if (evt.type === 'thinking' || evt.type === 'text') {
+            this.appendLog(log, evt.type, evt.text, box);
           } else if (evt.type === 'error') {
-            this.pushLog('error', evt.message);
+            this.pushLog(log, 'error', evt.message, box);
             this.showToast('分析失败: ' + evt.message, true);
           } else if (evt.type === 'done') {
-            this.pushLog('status', '✓ 分析完成，已生成草稿');
+            this.pushLog(log, 'status', '✓ 分析完成，已生成草稿', box);
             this.showToast('分析完成，已生成草稿');
             this.analyze.pr_url = '';
             this.loadDrafts();
@@ -437,24 +653,45 @@
             setTimeout(() => { this.tab = 'review'; }, 800);
           }
         },
-        // status/error 各占一行；thinking/text 增量追加到同类的最后一行，形成连续文本
-        pushLog(kind, text) {
-          this.analyzeLog.push({ kind, text });
-          this.scrollStream();
+        handleDiscoverEvent(evt) {
+          const log = this.discoverLog;
+          const box = 'discoverStreamBody';
+          if (evt.type === 'status') {
+            this.pushLog(log, 'status', evt.message, box);
+          } else if (evt.type === 'query') {
+            this.usedQuery = evt.query;
+            this.pushLog(log, 'status', '搜索语法：' + evt.query, box);
+          } else if (evt.type === 'candidates') {
+            this.pushLog(log, 'status', `搜到 ${evt.count} 条候选`, box);
+          } else if (evt.type === 'thinking' || evt.type === 'text') {
+            this.appendLog(log, evt.type, evt.text, box);
+          } else if (evt.type === 'error') {
+            this.pushLog(log, 'error', evt.message, box);
+            this.showToast('查找失败: ' + evt.message, true);
+          } else if (evt.type === 'result') {
+            this.prResults = evt.results || [];
+          }
         },
-        appendLog(kind, text) {
-          const last = this.analyzeLog[this.analyzeLog.length - 1];
+        // status/error 各占一行；thinking/text 增量追加到同类的最后一行，形成连续文本
+        pushLog(log, kind, text, boxRef) {
+          log.push({ kind, text });
+          this.scrollStream(boxRef);
+        },
+        appendLog(log, kind, text, boxRef) {
+          const last = log[log.length - 1];
           if (last && last.kind === kind) {
             last.text += text;
           } else {
-            this.analyzeLog.push({ kind, text });
+            log.push({ kind, text });
           }
-          this.scrollStream();
+          this.scrollStream(boxRef);
         },
-        scrollStream() {
+        scrollStream(boxRef) {
           if (!this.autoScroll) return;
           this.$nextTick(() => {
-            const el = this.$refs.streamBody;
+            // 两个 tab 的流式框各有独立 ref：都是 v-show 同时挂载，同名会互相覆盖。
+            // 按事件来源滚对应的框，不看当前 tab——「分析此 PR」会在流进行中切 tab。
+            const el = this.$refs[boxRef];
             if (el) el.scrollTop = el.scrollHeight;
           });
         },
@@ -510,7 +747,7 @@
         await this.loadCategories();
         await this.loadDrafts();
         await this.doSearch();
-        // 有草稿时默认停在 review 页，否则从分析页开始
+        // 有草稿时默认停在 review 页，否则从查找 PR 开始
         if (this.drafts.length) this.tab = 'review';
       },
     }).mount('#app');

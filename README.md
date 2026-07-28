@@ -4,12 +4,19 @@
 
 ## 工作方式
 
-记录知识是 agent 的工作，用户只做 review。数据流：`拉取 PR → LLM/agent 分析 → 生成草稿 → 用户 review → 入库 → 检索`。
+记录知识是 agent 的工作，用户只做 review。数据流：`查找 PR → 拉取 PR → LLM/agent 分析 → 生成草稿 → 用户 review → 入库 → 检索`。
 
-1. **提交** — 在页面填 PR 地址 + LLM 凭证（base_url/api_key/model）。
+0. **查找** — 只有一个模糊问题时，在「查找 PR」页填关键词（可中文）+ 仓库名：
+   LLM 把关键词翻成 GitHub 搜索语法，`gh` 搜出真实候选，LLM 再筛选排序并为每条写一句中文简介。
+   状态可选「仅已合并 / 仅未关闭 / 已关闭未合并」，结果可按价值 / 创建时间 / 更新时间重排，
+   每条都有跳转链接和「分析此 PR」按钮，一键接到下一步。
+1. **提交** — 在页面填 PR 地址 + LLM 凭证（base_url/api_key/model，两个页面共用一份）。
 2. **分析** — 服务端用 `gh` 拉取 PR，调 LLM 分析生成草稿。
 3. **review** — 在「待审草稿」页编辑标题/分类/标签/正文（左右分屏，右侧实时 Markdown 预览），确认后入库。
-4. **检索** — 按关键词/分类/标签查询，正文按 Markdown 渲染。
+4. **检索** — 按关键词/分类/标签查询已沉淀的知识，正文按 Markdown 渲染。
+
+> 查找 PR 的能力边界：GitHub 搜索只索引 PR 的标题、描述和评论，**不索引 diff**，
+> 所以「哪个 PR 改了某个函数」这类问题可能找不到。另外 GitHub 搜索接口限流 30 次/分钟。
 
 ## 快速开始
 
@@ -69,12 +76,16 @@ docker compose down              # 停止
 ## 命令行用法
 
 ```bash
+uv run pr-learner discover "cache" --repo owner/repo --state merged   # 搜索相关 PR
 uv run pr-learner fetch owner/repo 123                 # 拉取 PR，输出 Markdown 供阅读
 uv run pr-learner draft "标题" 分类 内容.md            # 生成待审草稿（供页面 review）
-uv run pr-learner search --keyword 重试                # 检索
+uv run pr-learner search --keyword 重试                # 检索知识
 uv run pr-learner categories                           # 分类统计
 uv run pr-learner reindex                              # 重建 knowledge/index.md
 ```
+
+> `discover` 命令**不调 LLM**，直接把 GitHub 搜索语法传给 `gh`——agent 自己就会写搜索语法。
+> 页面上的「查找 PR」才需要模型把中文关键词翻成搜索语法。
 
 ## 测试
 

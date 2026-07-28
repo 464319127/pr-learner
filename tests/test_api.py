@@ -192,3 +192,166 @@ def test_index_page_served(tmp_path: Path) -> None:
     assert res.status_code == 200
     assert "pr-learner" in res.text
     assert "vue" in res.text.lower()
+
+
+# --- 查找 PR ---
+
+
+def test_discover_prs_endpoint(tmp_path: Path, monkeypatch) -> None:
+    """POST /api/discover/prs：替身跳过 gh+LLM，验证返回 query 与结果列表。"""
+    client = _client(tmp_path)
+    from pr_learner import api
+
+    monkeypatch.setattr(
+        api.discover_mod,
+        "discover_prs",
+        lambda keyword, repo, **kw: {
+            "query": "cache is:merged",
+            "warning": "",
+            "results": [{"repo": repo, "number": 1, "title": "t", "url": "u", "summary": "s"}],
+        },
+    )
+    res = client.post(
+        "/api/discover/prs",
+        json={"keyword": "缓存", "repo": "o/r", "api_key": "sk-x", "model": "m"},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["query"] == "cache is:merged"
+    assert body["results"][0]["number"] == 1
+    # api_key 只做本次转发，绝不回显
+    assert "sk-x" not in res.text
+
+
+def test_discover_prs_requires_keyword_or_repo(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    res = client.post("/api/discover/prs", json={"keyword": "  ", "repo": ""})
+    assert res.status_code == 400
+
+
+def test_discover_prs_gh_error_is_400(tmp_path: Path, monkeypatch) -> None:
+    """gh 失败（仓库不存在/未登录）是用户侧问题，给 400 而不是 500。"""
+    client = _client(tmp_path)
+    from pr_learner import api
+    from pr_learner.fetch import GhError
+
+    def boom(keyword, repo, **kw):
+        raise GhError("仓库不存在或无权访问，请检查仓库名")
+
+    monkeypatch.setattr(api.discover_mod, "discover_prs", boom)
+    res = client.post("/api/discover/prs", json={"keyword": "x", "repo": "nope/nope"})
+    assert res.status_code == 400
+    assert "仓库不存在" in res.json()["detail"]
+
+
+def test_discover_prs_llm_error_is_502(tmp_path: Path, monkeypatch) -> None:
+    client = _client(tmp_path)
+    from pr_learner import api
+    from pr_learner.llm import LlmError
+
+    def boom(keyword, repo, **kw):
+        raise LlmError("LLM 返回 401")
+
+    monkeypatch.setattr(api.discover_mod, "discover_prs", boom)
+    res = client.post(
+        "/api/discover/prs",
+        json={"keyword": "x", "repo": "o/r", "api_key": "sk", "model": "m"},
+    )
+    assert res.status_code == 502
+
+
+def test_discover_prs_stream_endpoint(tmp_path: Path, monkeypatch) -> None:
+    client = _client(tmp_path)
+    from pr_learner import api
+
+    def fake_stream(keyword, repo, **kw):
+        yield {"type": "status", "message": "正在搜索 …"}
+        yield {"type": "query", "query": "cache"}
+        yield {"type": "candidates", "count": 2}
+        yield {"type": "thinking", "text": "筛选"}
+        yield {"type": "result", "results": [{"number": 1, "url": "u", "title": "t"}]}
+
+    monkeypatch.setattr(api.discover_mod, "discover_prs_stream", fake_stream)
+    res = client.post(
+        "/api/discover/prs/stream",
+        json={"keyword": "缓存", "repo": "o/r", "api_key": "sk-x", "model": "m"},
+    )
+    assert res.status_code == 200
+    body = res.text
+    for token in ("data:", "query", "candidates", "thinking", "result"):
+        assert token in body
+    assert "sk-x" not in body
+
+
+def test_discover_prs_stream_requires_input(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    res = client.post("/api/discover/prs/stream", json={"keyword": "", "repo": ""})
+    assert res.status_code == 400
+
+
+def test_stream_event_types_handled_by_frontend(monkeypatch) -> None:
+    """SSE 是纯字符串协议：后端新增/改名事件类型而前端没跟上会静默失效。
+
+    这里把两个流式生成器能产出的 type 全部收集出来，逐个检查页面 JS 里有处理。
+    """
+    from pr_learner import analyze, api, discover, llm
+    from pr_learner.fetch import PrSummary, PullRequest
+
+    html = (Path(api.__file__).parent / "static" / "index.html").read_text("utf-8")
+
+    fake_pr = PullRequest(
+        repo="o/r", number=1, title="t", author="a", state="OPEN", url="u", body="b", diff="d"
+    )
+    monkeypatch.setattr(analyze, "fetch_pr", lambda repo, number: fake_pr)
+    monkeypatch.setattr(
+        analyze,
+        "_iter_llm_stream",
+        lambda *a, **k: iter([("thinking", "t"), ("text", '{"title":"x","content":"y"}')]),
+    )
+    analyze_types = {
+        e["type"] for e in analyze.analyze_pr_stream("o/r", 1, api_key="sk", model="m")
+    }
+
+    monkeypatch.setattr(discover, "build_query", lambda *a, **k: ("q", "翻译失败"))
+    monkeypatch.setattr(
+        discover,
+        "search_prs",
+        lambda *a, **k: [PrSummary(repo="o/r", number=1, title="t", url="u")],
+    )
+    monkeypatch.setattr(
+        llm, "iter_stream", lambda *a, **k: iter([("thinking", "t"), ("text", '{"results":[]}')])
+    )
+    discover_types = {
+        e["type"] for e in discover.discover_prs_stream("kw", "o/r", api_key="sk", model="m")
+    }
+
+    # analyze 的 result 事件由 api.py 转成 done 后才推给页面
+    for t in (analyze_types - {"result"}) | {"done"}:
+        assert f"'{t}'" in html, f"前端 handleAnalyzeEvent 未处理事件类型 {t}"
+    for t in discover_types | {"error"}:
+        assert f"'{t}'" in html, f"前端 handleDiscoverEvent 未处理事件类型 {t}"
+
+
+def test_frontend_sends_all_required_analyze_fields() -> None:
+    """AnalyzeIn 的必填字段都要出现在页面组装的请求体里。
+
+    凭证被抽到共享的 this.llm 后，页面若还写 JSON.stringify(this.analyze) 就会
+    缺 api_key/model 被 422 挡下——而后端测试直接构造 json，永远抓不到这个。
+    """
+    import re
+
+    from pr_learner import api
+
+    html = (Path(api.__file__).parent / "static" / "index.html").read_text("utf-8")
+    m = re.search(r"'/api/analyze/stream'.*?body:\s*JSON\.stringify\((.*?)\),", html, re.DOTALL)
+    assert m, "找不到 /api/analyze/stream 的请求体组装代码"
+    body_expr = m.group(1)
+
+    required = {n for n, f in api.AnalyzeIn.model_fields.items() if f.is_required()}
+    assert required, "AnalyzeIn 应有必填字段"
+    for name in required:
+        # 字段要么显式出现，要么由 ...this.llm 展开带进来
+        assert name in body_expr or "...this.llm" in body_expr, (
+            f"请求体缺少必填字段 {name}：{body_expr}"
+        )
+    assert "...this.llm" in body_expr, "凭证应来自共享的 this.llm"

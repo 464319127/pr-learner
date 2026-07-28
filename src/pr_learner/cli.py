@@ -2,6 +2,7 @@
 
 示例：
     uv run pr-learner fetch owner/repo 123      # 拉取 PR 并输出 Markdown 供阅读
+    uv run pr-learner discover "cache is:merged" --repo owner/repo   # 搜索相关 PR
     uv run pr-learner save "标题" 分类 内容.md   # 保存一条知识
     uv run pr-learner search --keyword 重试       # 检索知识
     uv run pr-learner categories                 # 查看分类统计
@@ -67,6 +68,29 @@ def draft(
         title, category, content, tags=tag_list, source_pr=source_pr or None
     )
     typer.echo(f"已生成草稿 {d['id']}，请到页面 review：http://localhost:8000")
+
+
+@app.command()
+def discover(
+    query: str = typer.Argument("", help="GitHub 搜索语法，如 'moe performance is:merged'"),
+    repo: str = typer.Option(None, help="限定 owner/name 仓库"),
+    limit: int = typer.Option(20, help="最多返回条数（1-100）"),
+    state: str = typer.Option(None, help="open / merged / closed（closed 指已关闭未合并）"),
+    sort: str = typer.Option(None, help="created / updated / comments / reactions / interactions"),
+) -> None:
+    """搜索相关 PR 并列出编号、标题与链接。
+
+    这里**不调 LLM**：agent 自己就会写 GitHub 搜索语法，直接把 query 传进来即可。
+    页面上的「查找 PR」才需要模型把中文关键词翻成搜索语法。
+    注意 GitHub 不索引 diff，只索引标题、描述和评论。
+    """
+    prs = fetch_mod.search_prs(query, repo=repo, limit=limit, state=state, sort=sort)
+    if not prs:
+        typer.echo("无匹配 PR")
+        raise typer.Exit()
+    for pr in prs:
+        typer.echo(f"#{pr.number} [{pr.state}] {pr.title}")
+        typer.echo(f"    创建 {pr.created_at} · 更新 {pr.updated_at} · {pr.url}")
 
 
 @app.command()
