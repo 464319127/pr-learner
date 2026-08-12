@@ -72,19 +72,27 @@ def test_analyze_pr_stream_emits_status_and_result(monkeypatch) -> None:
     from pr_learner.fetch import PullRequest
 
     fake_pr = PullRequest(
-        repo="o/r", number=5, title="兜底标题", author="a", state="MERGED",
-        url="u", body="b", diff="d",
+        repo="o/r",
+        number=5,
+        title="兜底标题",
+        author="a",
+        state="MERGED",
+        url="u",
+        body="b",
+        diff="d",
     )
     monkeypatch.setattr(analyze, "fetch_pr", lambda repo, number: fake_pr)
     # 模型分两段吐出一个完整 JSON
     monkeypatch.setattr(
         analyze,
         "_iter_llm_stream",
-        lambda *a, **k: iter([
-            ("thinking", "先看 diff"),
-            ("text", '{"title":"标题","category":"网络",'),
-            ("text", '"tags":["tcp"],"content":"正文"}'),
-        ]),
+        lambda *a, **k: iter(
+            [
+                ("thinking", "先看 diff"),
+                ("text", '{"title":"标题","category":"网络",'),
+                ("text", '"tags":["tcp"],"content":"正文"}'),
+            ]
+        ),
     )
     events = list(analyze.analyze_pr_stream("o/r", 5, api_key="sk", model="m"))
     kinds = [e["type"] for e in events]
@@ -101,13 +109,17 @@ def test_analyze_pr_stream_reports_error_on_bad_json(monkeypatch) -> None:
     from pr_learner.fetch import PullRequest
 
     fake_pr = PullRequest(
-        repo="o/r", number=5, title="t", author="a", state="OPEN",
-        url="u", body="b", diff="d",
+        repo="o/r",
+        number=5,
+        title="t",
+        author="a",
+        state="OPEN",
+        url="u",
+        body="b",
+        diff="d",
     )
     monkeypatch.setattr(analyze, "fetch_pr", lambda repo, number: fake_pr)
-    monkeypatch.setattr(
-        analyze, "_iter_llm_stream", lambda *a, **k: iter([("text", "这不是JSON")])
-    )
+    monkeypatch.setattr(analyze, "_iter_llm_stream", lambda *a, **k: iter([("text", "这不是JSON")]))
     events = list(analyze.analyze_pr_stream("o/r", 5, api_key="sk", model="m"))
     assert events[-1]["type"] == "error"
 
@@ -117,14 +129,22 @@ def test_analyze_pr_assembles_fields(monkeypatch) -> None:
     from pr_learner.fetch import PullRequest
 
     fake_pr = PullRequest(
-        repo="o/r", number=5, title="原始PR标题", author="a", state="MERGED",
-        url="u", body="b", diff="d",
+        repo="o/r",
+        number=5,
+        title="原始PR标题",
+        author="a",
+        state="MERGED",
+        url="u",
+        body="b",
+        diff="d",
     )
     monkeypatch.setattr(analyze, "fetch_pr", lambda repo, number: fake_pr)
     monkeypatch.setattr(
         analyze,
         "_call_llm",
-        lambda *a, **k: '{"title":"提炼标题","category":"并发","tags":["锁","死锁"],"content":"正文"}',
+        lambda *a, **k: (
+            '{"title":"提炼标题","category":"并发","tags":["锁","死锁"],"content":"正文"}'
+        ),
     )
 
     out = analyze.analyze_pr("o/r", 5, api_key="sk-x", model="m")
@@ -139,8 +159,14 @@ def test_analyze_pr_falls_back_to_pr_title(monkeypatch) -> None:
     from pr_learner.fetch import PullRequest
 
     fake_pr = PullRequest(
-        repo="o/r", number=5, title="兜底标题", author="a", state="OPEN",
-        url="u", body="b", diff="d",
+        repo="o/r",
+        number=5,
+        title="兜底标题",
+        author="a",
+        state="OPEN",
+        url="u",
+        body="b",
+        diff="d",
     )
     monkeypatch.setattr(analyze, "fetch_pr", lambda repo, number: fake_pr)
     # 模型没给 title，应回退到 PR 标题
@@ -148,3 +174,56 @@ def test_analyze_pr_falls_back_to_pr_title(monkeypatch) -> None:
     out = analyze.analyze_pr("o/r", 5, api_key="sk-x", model="m")
     assert out["title"] == "兜底标题"
     assert out["category"] == "未分类"
+
+
+# --- content_format（docs/decisions/0005）---
+
+
+def _fake_pr():
+    from pr_learner.fetch import PullRequest
+
+    return PullRequest(
+        repo="o/r",
+        number=5,
+        title="兜底标题",
+        author="a",
+        state="MERGED",
+        url="u",
+        body="b",
+        diff="d",
+    )
+
+
+def test_fields_content_format_passthrough() -> None:
+    """模型给了能认出来的值就听它的，不再嗅探正文。"""
+    obj = {"content": "<p>a</p><p>b</p>", "content_format": "html"}
+    assert analyze._fields_from_obj(obj, _fake_pr(), "o/r", 5)["content_format"] == "html"
+    # 大小写与 md 别名都算「给了」
+    obj = {"content": "<p>a</p><p>b</p>", "content_format": "MD"}
+    assert analyze._fields_from_obj(obj, _fake_pr(), "o/r", 5)["content_format"] == "markdown"
+
+
+def test_fields_content_format_sniffs_when_absent_or_garbage() -> None:
+    """没给或给了垃圾值时嗅探正文——嗅探本身宁可判 markdown 也不误判 html。"""
+    html = {"content": "<div class='card'><p>a</p></div><p>b</p>"}
+    assert analyze._fields_from_obj(html, _fake_pr(), "o/r", 5)["content_format"] == "html"
+
+    md = {"content": "## 标题\n\n- 一条"}
+    assert analyze._fields_from_obj(md, _fake_pr(), "o/r", 5)["content_format"] == "markdown"
+
+    garbage = {"content": "<p>a</p><p>b</p>", "content_format": "xml"}
+    assert analyze._fields_from_obj(garbage, _fake_pr(), "o/r", 5)["content_format"] == "html"
+    garbage_md = {"content": "## 标题", "content_format": 42}
+    assert (
+        analyze._fields_from_obj(garbage_md, _fake_pr(), "o/r", 5)["content_format"] == "markdown"
+    )
+
+
+def test_parse_error_message_flags_truncation() -> None:
+    """开了 `{` 却没闭合 → 点名 max_tokens；纯散文 → 保持原始错误，不误报。"""
+    msg = analyze._parse_error_message('{"title":"t","content":"很长的正', ValueError("未找到"))
+    assert "max_tokens" in msg and "PR_LEARNER_ANALYZE_MAX_TOKENS" in msg
+
+    plain = analyze._parse_error_message("我无法完成这个请求", ValueError("未找到 JSON 对象"))
+    assert "max_tokens" not in plain
+    assert "未找到 JSON 对象" in plain

@@ -1,0 +1,154 @@
+---
+category: 推测解码与采样
+content_format: html
+date: '2026-07-24'
+source_pr: sgl-project/sglang#26312
+tags:
+- speculative-decoding
+- rejection-sampling
+- eagle
+- triton
+- cuda-graph
+- sampling
+title: 推测解码必须用真实草稿分布配合拒绝采样，才能同时保持目标分布正确性并提高接受长度
+---
+
+<h2>根因</h2>
+<p>原有 EAGLE 流程在生成草稿 token 和目标模型验证时都采用贪心策略：草稿侧直接取 <code>argmax</code>，验证侧也没有使用草稿模型的真实提议概率 <code>q</code>。这虽然省去了完整概率分布的保存和传输，但没有实现经典推测采样的概率校正；特别是在温度较高、分布较平坦时，草稿与目标模型的非最大概率质量被完全忽略，导致后续位置的接受率和平均接受长度偏低。</p>
+<p>关键问题不是简单地把接受阈值调宽。阈值式启发规则不能保证最终 token 仍严格服从目标分布 <code>p</code>，而经典拒绝采样可以在使用任意提议分布 <code>q</code> 的同时，通过接受概率和拒绝后的残差采样恢复目标分布。</p>
+<h2>机理</h2>
+<p>对于从草稿分布 <code>q</code> 抽出的 token <code>x</code>，经典推测采样按下式接受：</p>
+<p><code>A(x) = min(1, p(x) / q(x))</code></p>
+<p>实现中使用均匀随机数 <code>u</code>，判断 <code>u * q(x) &lt; p(x)</code>，与上述公式等价。若 token 被接受，则继续验证链上的下一个草稿 token；第一次拒绝后停止验证，并从残差分布中抽取替代 token：</p>
+<p><code>r(x) ∝ max(p(x) - q(x), 0)</code></p>
+<p>若整条草稿链都被接受，最后一个 bonus token 直接从下一位置的目标分布 <code>p</code> 中采样。接受步骤与残差补偿共同保证输出边缘分布仍为目标模型分布，而不是草稿模型分布。</p>
+<p>草稿侧也必须真正按 <code>q</code> 抽样，而不能继续使用 <code>argmax</code>。本次实现用 <code>torch.multinomial</code> 生成单路径草稿，并保存每一步完整的、经过温度缩放的草稿概率：</p>
+<p><code>q = softmax(draft_logits / temperature)</code></p>
+<p>让草稿侧使用与目标侧一致的温度并非正确性的必要条件，因为拒绝采样对任意合法 <code>q</code> 都成立；它的主要价值是缩小 <code>p</code> 与 <code>q</code> 的差异，从而提升接受率。目标侧仍按实际采样配置执行 temperature、top-k、top-p 和 min-p 归一化，因此验证必须使用运行时真正参与抽样的 <code>p</code> 与 <code>q</code>，不能用原始 logits 或未归一化概率替代。</p>
+<h2>实现上的关键约束</h2>
+<p>当前 Triton kernel 只处理 <code>topk=1</code> 的链式推测，不支持多分支树，因此启动时强制 <code>--speculative-eagle-topk=1</code>。它也只允许能产出目标词表完整提议分布的 EAGLE、EAGLE3 和解析为 EAGLE 的 NEXTN，拒绝 STANDALONE、FROZEN_KV_MTP、NGRAM、DFLASH 及多层 EAGLE。</p>
+<p>草稿词表必须与目标词表完全一致。若草稿使用 hot-vocab 或缩减词表，需要先通过 draft-to-target 映射把 <code>q</code> scatter 到目标词表空间；否则 <code>p(x)/q(x)</code> 和 <code>max(p-q, 0)</code> 没有共同的 token 坐标，计算结果不成立。本实现选择启动时报错，而不是静默执行错误校正。</p>
+<p>拒绝采样与旧的 acceptance threshold 参数语义冲突，因此要求两个阈值都保持 <code>1.0</code>。内核直接使用全局 RNG 生成接受硬币和最终采样硬币，其随机数消费依赖批次形状，无法保证 batch-invariant deterministic inference，所以与确定性推理模式显式互斥。</p>
+<h2>数据通路与 CUDA Graph 陷阱</h2>
+<p>拒绝采样需要把每一步完整 <code>q</code> 从草稿 worker 传到验证 kernel，张量形状约为 <code>(batch, num_steps, vocab)</code>。这项状态必须同时覆盖普通执行和系统中的所有批处理生命周期：</p>
+<ul>
+<li>draft extend 产生第一步 <code>q</code>，多步 draft 持续堆叠后传入 verify input。</li>
+<li>batch filter、merge、padding、overlap stash/restore 都必须同步处理 <code>draft_probs</code>。</li>
+<li>CUDA Graph capture 必须预分配静态 full-vocab buffer，replay 前清零并复制当前批次数据。</li>
+<li>graph capture 还需要构造有效的 <code>SamplingBatchInfo</code>，并在 replay 时更新每个请求的 temperature，否则图内可能使用 capture 阶段的占位温度。</li>
+<li>idle batch 也要创建形状正确的空概率张量，避免分布式或流水线空转分支破坏接口契约。</li>
+</ul>
+<p>这类功能最容易出现的错误不是采样公式本身，而是某个 batch 变换遗漏新张量，造成请求与概率行错位。实现既在启动参数层做能力检查，也在进入 Triton kernel 前再次检查 <code>draft_probs</code> 是否存在及词表维度是否匹配，这种双层校验适合跨 worker、CUDA Graph 和异步调度的数据通路。</p>
+<p>完整概率张量也带来明显显存和带宽成本。以 FP32 保存时，额外空间近似为 <code>4 × batch × num_steps × vocab</code> 字节，且 CUDA Graph、overlap buffer 和最终 verify input 可能各自持有副本。大词表、高 batch 或更多推测步数下，应评估峰值显存和复制开销；后续优化可以考虑低精度存储、融合生成与验证，或为缩减词表实现正确的 scatter 映射，但不能只保存已抽中 token 的标量 <code>q(x)</code>，因为拒绝后的残差采样需要完整 <code>p-q</code>。</p>
+<h2>Triton 内核设计权衡</h2>
+<p>内核按 batch 一实例串行验证草稿链，在词表维度以 <code>BLOCK_V=4096</code> 分块。拒绝后的最终采样需要两遍扫描词表：第一遍计算残差归一化和，第二遍构造分块 CDF 并定位 token。这避免了额外残差张量和通用采样 kernel 的中间写回，但每次拒绝最多读取两遍完整 <code>p</code> 和 <code>q</code>，性能依赖接受率与词表大小。</p>
+<p>目标概率有 <code>num_steps + 1</code> 行，而草稿概率只有 <code>num_steps</code> 行。全部接受时当前位置已经超出草稿概率范围，内核必须保证该分支只读取目标 <code>p</code>，不能投机加载越界的 <code>q</code>。这是 GPU kernel 中容易被分支优化或重构破坏的边界条件。</p>
+<p>实现将 <code>norm_sum == 0</code> 时的最终 token 回退为词表最后一个 token，并认为该情况数值上几乎不可能。理论上若 <code>p == q</code>，拒绝概率应为零；但浮点误差、概率归一化差异或 RNG 边界仍可能触发退化路径。任意回退到最后一个 token 会引入分布偏差，更稳健的做法是显式检测极小归一化和并回退到目标分布 <code>p</code>，同时记录诊断指标。</p>
+<h2>性能数据分析</h2>
+<p>下表中的“相对 No MTP”沿用 PR 数据；“RS 相对 MTP”用于隔离拒绝采样本身的增益。</p>
+<table>
+<thead>
+<tr>
+<th>模型 / 数据集 / 温度</th>
+<th style="text-align:right">No MTP tok/s</th>
+<th style="text-align:right">MTP tok/s</th>
+<th style="text-align:right">MTP+RS tok/s</th>
+<th style="text-align:right">RS 相对 MTP</th>
+<th style="text-align:right">接受长度变化</th>
+<th style="text-align:right">Verify Count 变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qwen3.5-397B / AtCoder / 1.0</td>
+<td style="text-align:right">1640.34</td>
+<td style="text-align:right">3280.80</td>
+<td style="text-align:right">3785.60</td>
+<td style="text-align:right">+15.4%</td>
+<td style="text-align:right">3.06 → 3.37（+10.0%）</td>
+<td style="text-align:right">333849 → 300011（-10.1%）</td>
+</tr>
+<tr>
+<td>Qwen3.5-397B / AtCoder / 0.6</td>
+<td style="text-align:right">1650.60</td>
+<td style="text-align:right">3496.49</td>
+<td style="text-align:right">3662.92</td>
+<td style="text-align:right">+4.8%</td>
+<td style="text-align:right">3.33 → 3.46（+3.8%）</td>
+<td style="text-align:right">301375 → 297365（-1.3%）</td>
+</tr>
+<tr>
+<td>Qwen3.5-397B / DeepMath / 1.0</td>
+<td style="text-align:right">2365.02</td>
+<td style="text-align:right">4587.43</td>
+<td style="text-align:right">4929.50</td>
+<td style="text-align:right">+7.5%</td>
+<td style="text-align:right">3.20 → 3.46（+7.9%）</td>
+<td style="text-align:right">314038 → 288101（-8.3%）</td>
+</tr>
+<tr>
+<td>Qwen3.5-397B / DeepMath / 0.6</td>
+<td style="text-align:right">2334.44</td>
+<td style="text-align:right">4781.54</td>
+<td style="text-align:right">4916.06</td>
+<td style="text-align:right">+2.8%</td>
+<td style="text-align:right">3.43 → 3.50（+2.0%）</td>
+<td style="text-align:right">277181 → 270616（-2.4%）</td>
+</tr>
+<tr>
+<td>GLM-5 / DeepMath / 1.0</td>
+<td style="text-align:right">1226.78</td>
+<td style="text-align:right">2538.90</td>
+<td style="text-align:right">2642.54</td>
+<td style="text-align:right">+4.1%</td>
+<td style="text-align:right">3.06 → 3.25（+6.3%）</td>
+<td style="text-align:right">286352 → 260021（-9.2%）</td>
+</tr>
+</tbody>
+</table>
+<p>数据表明，RS 的收益主要来自更长的连续接受链和更少的目标验证次数，而不是单纯降低单次 kernel 成本。所有场景中 MTP+RS 相对无 MTP 的吞吐提升为 <code>+108.4%</code> 至 <code>+130.8%</code>；但隔离 MTP 基线后，RS 自身的吞吐增益约为 <code>+2.8%</code> 至 <code>+15.4%</code>。</p>
+<p>温度为 <code>1.0</code> 时收益明显高于 <code>0.6</code>。低温分布更尖锐，原有贪心草稿已经更接近目标选择，经典采样能够回收的概率质量较少；高温时非 argmax token 的质量增大，按真实 <code>q</code> 抽样及 <code>p/q</code> 接受准则更有优势。分步接受率的改善通常在后续步骤更显著，例如 AtCoder、温度 1.0 时分别提升 <code>11.2%</code>、<code>16.9%</code>、<code>18.6%</code>，说明早期错误会截断整条草稿链，修正提议机制能放大到后续位置。</p>
+<h2>正确性与测试解读</h2>
+<p>Qwen3.5-9B 在 200 个 GSM8K 样例上的结果为：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align:right">结果</th>
+<th style="text-align:right">测试门槛</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GSM8K score</td>
+<td style="text-align:right">0.905</td>
+<td style="text-align:right">&gt; 0.8</td>
+</tr>
+<tr>
+<td>平均接受长度</td>
+<td style="text-align:right">PR 日志未给出具体值</td>
+<td style="text-align:right">&gt; 2.5</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td style="text-align:right">16.09</td>
+<td style="text-align:right">无门槛</td>
+</tr>
+<tr>
+<td>输出吞吐</td>
+<td style="text-align:right">1404.62 tok/s</td>
+<td style="text-align:right">无门槛</td>
+</tr>
+</tbody>
+</table>
+<p><code>0.905</code> 的分数说明该路径没有出现明显精度崩溃，但单次任务分数和宽松阈值不能证明采样分布严格等价。更有说服力的测试应在小词表上枚举或大量采样，对比 RS 输出频率与目标 <code>p</code>，并覆盖首次拒绝、中间拒绝、全部接受、<code>p(x)=0</code>、<code>q(x)=0</code>、残差和接近零以及不同 temperature/top-p/top-k 配置。</p>
+<p>该注册测试在 5090、单卡 H100 和双卡 H100 上连续出现三次失败，之后双卡 H100 重跑通过；评论中没有给出失败根因。最终通过不足以消除随机性、资源配置或多卡时序问题，尤其此功能使用全局 RNG。应固定可控随机种子进行分布测试，把服务启动/资源失败与算法断言失败分开记录，并避免仅靠重跑判定稳定性。</p>
+<h2>可迁移教训</h2>
+<ol>
+<li>推测解码的正确性取决于“生成提议、记录提议概率、接受判定、拒绝补偿”四个环节使用同一套概率语义；只替换其中一个环节通常会产生有偏输出。</li>
+<li><code>q</code> 越接近 <code>p</code>，接受率通常越高，但不要以修改 <code>q</code> 为由省略拒绝后的残差校正。温度对齐是性能优化，<code>p/q</code> 与 <code>max(p-q,0)</code> 才是正确性基础。</li>
+<li>新增跨阶段 GPU 张量时，应系统检查 filter、merge、padding、idle、overlap、CUDA Graph capture/replay 和分布式 worker 边界，不能只修改生产者与消费者。</li>
+<li>对算法能力限制应尽早失败：树形与链式结构、词表映射、确定性要求及旧参数冲突都应在启动阶段明确验证，并在 kernel 边界保留输入形状检查。</li>
+<li>性能报告要区分“相对无推测基线”和“相对现有推测实现”。本例 headline 可达到 <code>+130.8%</code>，但拒绝采样自身的边际吞吐收益最高约为 <code>15.4%</code>。</li>
+<li>GPU 概率算法必须为数值退化路径定义无偏或至少可诊断的行为；把极小概率事件直接映射到固定 token，会让罕见浮点问题变成隐蔽的生成偏差。</li>
+</ol>

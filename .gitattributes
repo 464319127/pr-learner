@@ -1,0 +1,5 @@
+# 压缩后的第三方库是单行文件，git diff 会把整个文件（mermaid 有 3.5 MB）吐成一行。
+# 标成 -diff 让 git 视为二进制、只报「binary files differ」。
+*.min.js -diff
+*.min.css -diff
+src/pr_learner/static/vendor/vue.global.prod.js -diff

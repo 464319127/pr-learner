@@ -6,3 +6,5 @@
 {output_template}
 
 正文用中文。
+
+{html_rules}

@@ -1,0 +1,176 @@
+---
+category: CUDA内核与MoE性能
+content_format: html
+date: '2026-07-28'
+source_pr: deepseek-ai/DeepGEMM#323
+tags:
+- sm90
+- mega-moe
+- fp8
+- wgmma
+- 调度
+- 性能分析
+title: SM90 上融合 MegaMoE 不一定带来收益，硬件能力、量化布局与调度必须共同匹配
+---
+
+<h2>根因</h2>
+<p>MegaMoE 的核心收益来自把 DeepEP dispatch、专家 GEMM、SwiGLU、激活量化和 combine 尽可能融合，并通过共享缓冲区减少中间结果落地与跨卡同步。但这种收益依赖硬件是否能够承载融合后的资源需求。SM90（Hopper）与 SM100（Blackwell）并非只存在指令集差异：SM90 没有 TMEM，WGMMA 累加器主要占用寄存器；FP8 的 scale-factor 计算也缺少专用硬件支持，较多工作由 CUDA core 完成。因此，融合后减少的 kernel launch、访存和同步开销，可能被寄存器压力、流水线停顿、scale 计算以及较差的占用率抵消。</p>
+<p>另一个关键因素是比较对象。PR 中的 Hopper baseline 是 DeepEP dispatch + 两次 grouped FP8 GEMM + Triton SwiGLU + DeepEP combine，且 SM90 grouped GEMM 只支持 L2 activation per-128-K scale，而 fused 路径使用 per-64-K scale。两者在数据布局、量化粒度和执行管线方面并不完全等价，因此既不能把 baseline 的输出作为 bitwise correctness oracle，也不能仅凭一个端到端时间判断融合本身的纯收益。部分测试还将 fused kernel 的 GPU 时间与包含通信、combine 和 host 流程的 baseline 时间进行比较，必须明确测量边界。</p>
+<h2>关键机理</h2>
+<h3>1. 融合会把多个阶段的资源压力叠加到同一个 CTA</h3>
+<p>MegaMoE kernel 同时负责 token 路由、TMA 搬运、WGMMA 计算、SwiGLU、FP8 量化、scale 写回和跨 rank 通信协同。单独的 grouped GEMM 可以让每个 kernel 专注于矩阵乘，而融合 kernel 必须保存更多中间状态、同步屏障和地址描述符。SM90 上寄存器累加器没有 TMEM 分流，较大的 <code>block_m</code>、<code>block_n</code> 或更多 epilogue warpgroup 会迅速提高寄存器占用，并降低 active warps 或 occupancy。</p>
+<h3>2. 编译器警告不等于真实寄存器 spill，但仍可能表示性能风险</h3>
+<p>讨论中的 <code>ptxas</code> 输出同时出现了：</p>
+<ul>
+<li><code>56 bytes stack frame</code> 和 <code>Local memory used</code>；</li>
+<li><code>Used 168 registers</code>；</li>
+<li><code>wgmma.mma_async instructions are serialized due to wgmma pipeline crossing function boundary</code>；</li>
+<li>但最终为 <code>0 bytes spill stores, 0 bytes spill loads</code>。</li>
+</ul>
+<p>这说明该版本并没有发生传统意义上的寄存器溢出到 local memory，但存在栈帧、函数边界和 WGMMA pipeline 相关的潜在代价。判断 spill 时应优先看 <code>spill stores/loads</code>、local load/store 指令和实际 kernel profile，不能仅根据 <code>Local memory used</code> 或 <code>stack frame</code> 文本下结论。反过来，即使没有 spill，WGMMA 因函数调用边界被序列化，也可能显著降低吞吐。</p>
+<h3>3. SM90 的 scale-factor 处理本身可能成为瓶颈</h3>
+<p>该实现需要处理 FP8 权重、per-128-K 输入 scale，以及 fused L1 epilogue 产生的 per-64-K L2 activation scale。SM90 没有针对这些 scale 操作的硬件加速，SFA/SFB 的读取、转换和计算会消耗 CUDA core、寄存器和共享内存资源。减少 scale 粒度或直接采用不带 scale 的 FP8/FP8 计算可能提升 MFU，但会改变数值语义，必须通过精度和模型级回归验证，不能直接作为无损优化。</p>
+<h3>4. 调度阈值会造成离散性能悬崖</h3>
+<p>SM90 路径根据 expected tokens per expert 选择 <code>BLOCK_M</code>、split-N、epilogue warpgroup 数量、expert wave 和 swapAB 等配置。例如讨论中 DSV4 参数在约 448 到 640 tokens 区间出现性能低谷，而 648 tokens 性能突然提升约 50%。这类现象通常不是算力连续变化导致，而是 token 数跨过调度阈值后切换了 block 或 wave 配置，解决方法包括：</p>
+<ul>
+<li>打印实际选择的完整 kernel configuration，而不是只打印模型参数；</li>
+<li>扫描阈值附近的 token 数，绘制配置和耗时的对应关系；</li>
+<li>检查 block padding、每 expert token 分布和最后一个不满 block 的浪费；</li>
+<li>将经验阈值从硬编码表提升为可解释的 cost model，或至少保留运行时可覆盖的调参开关。</li>
+</ul>
+<h2>修复与设计要点</h2>
+<p>PR 为 SM90 增加了独立的 API、SymmBuffer 布局、权重变换、JIT runtime、heuristics 和测试脚本，主要做法包括：</p>
+<ul>
+<li>通过 <code>transform_weights_for_mega_moe_sm90</code> 对 FP8 权重做适合 fused kernel 的 gate/up 交错布局；</li>
+<li>对 SM90 使用 FP32 scale，并区分输入 per-128-K 与 L2 激活 per-64-K 的布局；</li>
+<li>使用 <code>block_m=64/128</code>、split-N、swapAB、expert wave 和多种 epilogue warpgroup 组合应对 decode 与 prefill；</li>
+<li>为调度和实验保留环境变量，例如 <code>DG_SM90_FP8_SWAP_AB</code>、<code>DG_SM90_FP4_PREFILL_E</code> 和 JIT verbose 配置；</li>
+<li>用 <code>bench_kineto</code> 抽取 fused kernel 时间，同时用 CUDA event 测量 baseline，并输出 TFLOPS、HBM、NVLink 和 reduction 估算。</li>
+</ul>
+<p>讨论中的后续实验还尝试调整计算 warpgroup、修复 swapAB 的 scale pool stride、改变 decode/pre-fill 分界、关闭部分 scale 处理，以及使用 FP8 combine 来减少 NVLink 传输。这些方向说明优化重点已经从“增加融合”转向“降低融合 kernel 的资源压力并改善调度”。</p>
+<h2>性能数据分析</h2>
+<h3>H20 上 PR 版本的 fused 与 baseline 对比</h3>
+<p>Stone749990226 在 4 卡 H200、8192 tokens/rank、hidden=7168、intermediate_hidden=3072、384 experts、topk=6 下测得：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th style="text-align:right">时间</th>
+<th style="text-align:right">TFLOPS</th>
+<th style="text-align:right">HBM</th>
+<th style="text-align:right">NVLink</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fused MegaMoE</td>
+<td style="text-align:right">26617 us</td>
+<td style="text-align:right">243-245</td>
+<td style="text-align:right">292 GB/s</td>
+<td style="text-align:right">40 GB/s</td>
+<td>融合路径较慢</td>
+</tr>
+<tr>
+<td>DeepEP + grouped GEMM baseline</td>
+<td style="text-align:right">9638-9653 us</td>
+<td style="text-align:right">669-676</td>
+<td style="text-align:right">800-802 GB/s</td>
+<td style="text-align:right">110-111 GB/s</td>
+<td>baseline 约快 2.76 倍</td>
+</tr>
+</tbody>
+</table>
+<p>此结果表明，在该大 token 配置下，瓶颈更接近 HBM/计算流水线效率，而不是 kernel launch 或小规模通信。fused 路径的有效 HBM 和 NVLink 吞吐明显低于 baseline，说明融合 kernel 没有把硬件带宽利用起来。EP4 规模、无 RDMA 环境和具体 token/expert 分布也会影响结论，不能直接推广到 EP8 或其他互联拓扑。</p>
+<h3>PR 描述中的 8 卡 H20 模型级数据</h3>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th style="text-align:right">batch=1 加速</th>
+<th style="text-align:right">batch=256 加速</th>
+<th style="text-align:right">batch=8192 加速</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DeepSeekV4Flash</td>
+<td style="text-align:right">2.686x</td>
+<td style="text-align:right">2.231x</td>
+<td style="text-align:right">1.222x</td>
+</tr>
+<tr>
+<td>DeepSeekV4Pro</td>
+<td style="text-align:right">2.219x</td>
+<td style="text-align:right">2.096x</td>
+<td style="text-align:right">1.105x</td>
+</tr>
+</tbody>
+</table>
+<p>这些结果显示 MegaMoE 的收益主要集中在小 batch/decode 区间，随着 batch 增大收益快速收敛。该趋势与融合减少调度、通信和中间结果开销相符，但也说明它不是普遍的吞吐优化。</p>
+<h3>CP8/EP8 模型级结果</h3>
+<table>
+<thead>
+<tr>
+<th>输入/输出</th>
+<th style="text-align:right">SLO throughput 提升</th>
+<th style="text-align:right">Max throughput 提升</th>
+<th style="text-align:right">GSM8K</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3500/1500</td>
+<td style="text-align:right">+7.9%</td>
+<td style="text-align:right">+6.2%</td>
+<td style="text-align:right">off 0.975 / on 0.970</td>
+</tr>
+<tr>
+<td>32000/1500</td>
+<td style="text-align:right">+29.0%</td>
+<td style="text-align:right">+24.7%</td>
+<td style="text-align:right">off 0.975 / on 0.970</td>
+</tr>
+<tr>
+<td>128000/1500</td>
+<td style="text-align:right">+17.0%</td>
+<td style="text-align:right">+22.7%</td>
+<td style="text-align:right">off 0.975 / on 0.970</td>
+</tr>
+</tbody>
+</table>
+<p>模型级吞吐仍有正收益，但 GSM8K 从 0.975 降到 0.970，说明 fused 路径的量化粒度、clamp、fast math 或 reduction 顺序可能带来可观测的数值差异。单个 benchmark 的精度指标不能替代更广泛的模型回归，尤其需要报告误差分布、invalid rate 和长序列稳定性。</p>
+<h3>其他测试的边界</h3>
+<p>另一个 8 卡测试在 hidden=4096、intermediate_hidden=2048 下报告 batch 1 到 1024 约 1.07x 到 1.79x 的 fused 加速，但 batch 4096 和 8192 时分别为 0.995x 和 0.987x，基本没有收益。这进一步说明：</p>
+<ul>
+<li>decode 场景可以从减少 launch、dispatch/combine 和小矩阵低利用率中获益；</li>
+<li>大 token 场景会回到内存带宽、scale 计算、寄存器占用和流水线利用率主导；</li>
+<li>“融合 kernel 更快”必须按 token 数、每 expert token 分布、EP 规模和测量边界分别报告。</li>
+</ul>
+<h2>可迁移的工程教训</h2>
+<ol>
+<li>
+<p><strong>先定义公平的基线。</strong> 对比时固定量化格式、scale 粒度、通信协议、同步语义和测量范围；如果为了适配现有 grouped GEMM 而改变 scale 粒度，应明确标记为 legacy reference，而不是严格 correctness 或性能基线。</p>
+</li>
+<li>
+<p><strong>将 kernel 编译质量纳入性能测试。</strong> JIT kernel 至少应记录 CUDA/NVCC 版本、寄存器数、spill stores/loads、stack frame、local memory 指令和关键 ptxas 警告。不同编译器版本可能改变寄存器分配和 WGMMA 调度，性能结果必须可复现。</p>
+</li>
+<li>
+<p><strong>融合不是免费优化。</strong> 评估融合收益时，同时检查 occupancy、register pressure、SMEM stages、barrier 数量、TMA wait、WGMMA scoreboard 和 CUDA-core scale 计算。若融合后有效 HBM/SM 利用率下降，拆分成高度优化的 dispatch、GEMM 和 combine 反而可能更快。</p>
+</li>
+<li>
+<p><strong>把 decode 和 prefill 当成不同内核问题。</strong> decode 的每 expert token 很少，重点是减少空 tile、同步和固定开销；prefill 的重点是带宽、流水线深度和大 tile 利用率。单套阈值和单一 block 配置很难覆盖两者。</p>
+</li>
+<li>
+<p><strong>对阈值附近做连续扫描。</strong> 只测 batch=1、512、8192 会隐藏调度断点。应在每个 heuristic threshold 两侧进行细粒度扫描，并记录实际配置、padding 比例、expert wave 数和 kernel 时间。</p>
+</li>
+<li>
+<p><strong>硬件差异必须进入设计前提。</strong> SM90 没有 TMEM，不能直接套用 SM100 的寄存器/累加器设计；SM90 的 FP8 scale 也不能假设有 SM100 同等硬件支持。跨架构移植应先建立资源模型，再决定哪些阶段值得融合。</p>
+</li>
+<li>
+<p><strong>实验开关要与正式语义隔离。</strong> FP4 activation、FP8 combine、关闭 scale 或修改 swapAB 都可能改变精度和 buffer layout。环境变量适合快速 A/B，但正式 API 应明确 dtype、scale layout、通信格式和兼容性约束，避免 host buffer size 与 kernel view 不一致。</p>
+</li>
+<li>
+<p><strong>模型级收益需要和微内核收益分开解释。</strong> kernel 时间变快不代表端到端吞吐一定变快；反之，低延迟路径的收益可能来自减少通信和调度，而非 GEMM MFU 提升。应同时报告 kernel-only、端到端、SLO throughput、精度和 invalid rate。</p>
+</li>
+</ol>

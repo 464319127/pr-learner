@@ -1,0 +1,131 @@
+---
+category: CUDA 内核融合与推理性能
+content_format: html
+date: '2026-07-29'
+source_pr: sgl-project/sglang#32699
+tags:
+- cuda
+- moe
+- kernel-fusion
+- 低延迟
+- 量化
+- 性能分析
+title: 通过单次 CUDA launch 并发执行 MoE 路由、量化和索引打包，降低小批量解码的启动开销
+---
+
+<h2>根因</h2>
+<p>Kimi-K3 的 MoE decode 路径在每个 MoE 层都依次执行三个很小的 CUDA kernel：<code>route_radix</code>、<code>per_token_group_quant</code> 和 <code>pack_topk_ids</code>。单个 kernel 的计算量很低，在 <code>M=1</code> 等小 batch 场景下，主要成本来自 kernel launch、内存访问和 kernel 之间的串行依赖。K3 有 92 个 MoE 层，因此这些操作会重复 92 次，既消耗 GPU busy time，也把额外的 launch latency 直接放在 decode critical path 上。</p>
+<p>这类问题的关键不一定是单个 kernel 的算术效率，而是多个低占用、强串行的小 kernel 叠加后的调度成本。即使三个 kernel 的总计算量不变，减少 launch 次数并增加可并发工作，也可能改善端到端 token latency。</p>
+<h2>设计与机理</h2>
+<p>融合 kernel 使用 <code>2M</code> 个 CTA：</p>
+<ul>
+<li><code>[0, M)</code> 的 CTA 执行原有 radix routing 逻辑，并在 routing epilogue 中直接生成 <code>(expert_id &lt;&lt; 16) | bf16(weight)</code> 的 TRT-LLM packed id。</li>
+<li><code>[M, 2M)</code> 的 CTA 每个处理一个 token 的 MXFP8 group-32 quantization。</li>
+<li>两部分共享同一次 kernel launch；量化 CTA 与路由 CTA 可以重叠执行，pack 操作则被折叠为 routing 结果写回阶段的额外存储。</li>
+</ul>
+<p>实现上将原 <code>route_radix_kernel</code> 的主体提取为可复用的 <code>route_radix_block</code> device function，再由独立 kernel 和融合 kernel 共用。这避免了复制两份路由逻辑，也保留了原有的同步、共享内存和排序行为。路由侧继续禁用 fast-math，因为 top-k 结果和权重需要与原实现 bit-exact；量化侧使用显式 intrinsic 和位操作，不依赖 fast-math。</p>
+<p>融合并不是通用 MoE kernel，而是针对 K3 的稳定形状做专门化：896 个 expert、top-16、3584 维 BF16 activation、group size 32、UE8M0 packed scale，并将 <code>M</code> 限制在 64 以内。这样可以固定 CTA 布局和线程映射，量化侧使用一个 224-thread CTA 处理一个 token，同时明确控制融合收益成立的 batch 范围。</p>
+<h2>跨模块数据传递</h2>
+<p>路由输入和待量化 activation 分别位于不同模块，直接扩展函数签名会扩大调用链的接口改动。PR 使用了一个 consume-once 的 handoff stash：</p>
+<ol>
+<li>Kimi-K3 forward 在调用 <code>topk</code> 前暂存 <code>routed_input</code>。</li>
+<li>路由模块命中覆盖条件后执行融合 kernel，并发布 packed ids、量化 activation 和 scale。</li>
+<li>MoE quantization 方法用 activation 的存储身份取回这些结果，跳过独立的 quant 和 pack kernel。</li>
+<li>forward 结束后通过 <code>finally</code> 清理 stash，避免异常、fallback 或 allocator 复用造成状态泄漏。</li>
+</ol>
+<p><code>take()</code> 不只比较 tensor shape，还验证 <code>data_ptr</code>、dtype 和 stride。这样可以防止 activation 被复制、重新 view 或换成另一块存储后误消费旧结果。任一阶段没有命中，调用方都会回退到原有的三个 kernel 链路，因此融合属于透明优化，而不是新的必经执行路径。</p>
+<p>这种 handoff 的权衡是：它减少了跨层 API 改造，但引入了隐式的临时状态。要使用这种模式，必须同时具备严格的生命周期边界、consume-once 语义、身份校验和无条件清理；否则容易出现跨请求、跨层或 allocator 地址复用导致的错误关联。</p>
+<h2>正确性保障</h2>
+<p>融合结果需要同时匹配三个原始实现，而不仅是最终 MoE 输出。测试逐项比较了：</p>
+<ul>
+<li>routing 的 expert ids；</li>
+<li>FP32 routing weights 的 bit pattern；</li>
+<li>TRT-LLM packed ids；</li>
+<li>FP8 quantized activation 的 bit pattern；</li>
+<li>UE8M0 packed scales。</li>
+</ul>
+<p>测试覆盖随机分数、全 tie 分数、包含 NaN 的分数，以及连续和带 stride 的 activation 行。全 tie 和 NaN 特别重要：top-k 的 tie-break 规则、NaN 比较行为以及浮点到 BF16 的舍入方式，都可能让“数值接近”的实现产生不同的路由结果。最终测试结果为 25/25 通过，说明融合实现与 unfused chain 在这些边界条件下保持 bit-exact。</p>
+<p>此外，GSM8K 200 题、5-shot、<code>--parallel 64</code> 的结果为两次均 <code>0.995 / 0.995</code>，与分支基线一致，未观察到模型精度回归。</p>
+<h2>性能数据</h2>
+<p>端到端结果来自 2x4 GB300、TP8、<code>random</code> 4096 input / 1024 output：</p>
+<table>
+<thead>
+<tr>
+<th>batch size</th>
+<th style="text-align:right">unfused output tok/s</th>
+<th style="text-align:right">fused output tok/s</th>
+<th style="text-align:right">吞吐变化</th>
+<th style="text-align:right">Mean TPOT 变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td style="text-align:right">111.90</td>
+<td style="text-align:right">114.85</td>
+<td style="text-align:right">+2.6%</td>
+<td style="text-align:right">8.60 ms -&gt; 8.36 ms，-2.8%</td>
+</tr>
+<tr>
+<td>64</td>
+<td style="text-align:right">1626.03</td>
+<td style="text-align:right">1635.53</td>
+<td style="text-align:right">+0.6%</td>
+<td style="text-align:right">33.47 ms -&gt; 33.20 ms，-0.8%</td>
+</tr>
+</tbody>
+</table>
+<p><code>bs=1</code> torch profiler 的 MoE-front prep 统计如下：</p>
+<table>
+<thead>
+<tr>
+<th>kernel / 汇总</th>
+<th style="text-align:right">unfused</th>
+<th style="text-align:right">fused</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>route_radix_kernel</code></td>
+<td style="text-align:right">8375.1 us</td>
+<td style="text-align:right">消失</td>
+</tr>
+<tr>
+<td><code>per_token_group_quant_flat_kernel</code></td>
+<td style="text-align:right">6240.6 us</td>
+<td style="text-align:right">消失</td>
+</tr>
+<tr>
+<td><code>_pack_topk_ids_triton_kernel</code></td>
+<td style="text-align:right">2863.1 us</td>
+<td style="text-align:right">消失</td>
+</tr>
+<tr>
+<td><code>route_quant_fused_kernel</code></td>
+<td style="text-align:right">消失</td>
+<td style="text-align:right">8485.6 us</td>
+</tr>
+<tr>
+<td>MoE-front prep 总 busy time</td>
+<td style="text-align:right">17478.8 us</td>
+<td style="text-align:right">8485.6 us</td>
+</tr>
+<tr>
+<td>每层平均</td>
+<td style="text-align:right">7.60 us</td>
+<td style="text-align:right">3.69 us</td>
+</tr>
+</tbody>
+</table>
+<p>在 25 个 steady-state decode step、92 个 MoE 层的统计中，融合减少了每步 359.7 us 的 GPU busy time，并减少 184 次 launch；全 trace GPU busy time 从 342.90 ms 降到 339.60 ms，distinct kernel 数从 45 降到 43。<code>bs=1</code> 的端到端收益高于单纯 busy-time 节省，原因是被移除的 kernel 原本串行位于 decode critical path 上，launch latency 会直接影响 token 间隔。</p>
+<p><code>bs=64</code> 时这些操作占单步比例更低，并且更容易与其他工作重叠，因此收益只有 +0.6%，接近测量噪声。这表明该优化主要针对低并发 decode，应以低 batch latency 为主要目标，同时确认高 batch 不产生负收益，而不应期待所有负载都获得同等加速。</p>
+<h2>可迁移的工程经验</h2>
+<ul>
+<li>对小 batch 推理进行 profiling 时，要同时看 kernel busy time、launch 次数、依赖链和端到端 TPOT；仅比较单 kernel duration 容易漏掉 launch-bound 瓶颈。</li>
+<li>融合多个 kernel 时，优先识别是否存在独立工作可以并发。这里量化 CTA 不依赖 routing 输出，而是读取同一份 GEMM activation，因此能够与 routing CTA 重叠；只有真正存在数据依赖的 pack 才放入 routing epilogue。</li>
+<li>融合数值敏感的路由逻辑时，应复用原 device code，并保持编译选项、舍入模式、tie-break、NaN 行为和位级打包规则一致。重新实现“等价算法”并不足以保证 MoE 路由一致。</li>
+<li>专门化 kernel 必须配套明确的 coverage predicate。形状、dtype、stride、对齐、token 数和 runner 条件都应在入口验证；不满足条件时保留成熟 fallback，避免为了少数形状污染通用路径。</li>
+<li>跨模块 handoff 可以降低接口改造成本，但隐式全局状态必须具备明确的 stage/consume/clear 生命周期，并在消费前进行存储身份验证。</li>
+<li>正确性测试应比较中间产物而非只比较最终模型输出，尤其要覆盖 strided view、全 tie、NaN、边界 batch 和对齐条件；否则融合错误可能被后续算子或模型容差掩盖。</li>
+<li>性能优化应区分“低 batch 关键路径收益”和“高 batch 吞吐收益”。当工作在高并发下已被隐藏时，进一步融合的主要价值可能只体现在 decode latency，而不是总吞吐。</li>
+</ul>

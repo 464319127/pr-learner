@@ -11,6 +11,9 @@ dependencies = [
     "pydantic>=2.10",
     "python-frontmatter>=1.1",
     "httpx>=0.28",
+    # convert 命令把历史 .md 正文转成 HTML 用。它本来已通过 typer→rich 在依赖树里，
+    # 但依赖一个传递依赖是脆的，显式声明。
+    "markdown-it-py>=3",
 ]
 
 [project.scripts]
@@ -29,8 +32,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pr_learner"]
-# 确保前端静态资源与提示词模板随包一起分发
-artifacts = ["src/pr_learner/static/*", "src/pr_learner/prompt_templates/**/*"]
+# 确保前端静态资源与提示词模板随包一起分发。
+# static 必须用 `**/*`：写成 `static/*` 只匹配直接子项，vendor/ 子目录不会进 wheel，
+# 本地 editable 安装与测试照旧全绿，只在 wheel / Docker 构建后炸。
+artifacts = ["src/pr_learner/static/**/*", "src/pr_learner/prompt_templates/**/*"]
 
 [tool.ruff]
 line-length = 100

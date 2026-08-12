@@ -72,7 +72,8 @@ def test_analyze_endpoint_creates_draft(tmp_path: Path, monkeypatch) -> None:
         lambda repo, number, **kw: {
             "title": "分析出的标题",
             "category": "网络",
-            "content": "正文",
+            "content": "<p>正文</p>",
+            "content_format": "html",
             "tags": ["tcp"],
             "source_pr": f"{repo}#{number}",
         },
@@ -87,6 +88,8 @@ def test_analyze_endpoint_creates_draft(tmp_path: Path, monkeypatch) -> None:
     )
     assert res.status_code == 200, res.text
     assert res.json()["source_pr"] == "o/r#7"
+    # analyze 判定的正文格式要一路带进草稿，否则 approve 时会静默落成 .md
+    assert res.json()["content_format"] == "html"
     # 草稿已生成，尚未进正式库
     assert len(client.get("/api/drafts").json()) == 1
     assert client.get("/api/categories").json() == {}
@@ -115,7 +118,8 @@ def test_analyze_stream_endpoint(tmp_path: Path, monkeypatch) -> None:
             "fields": {
                 "title": "流式标题",
                 "category": "网络",
-                "content": "正文",
+                "content": "<p>正文</p>",
+                "content_format": "html",
                 "tags": ["tcp"],
                 "source_pr": f"{repo}#{number}",
             },
@@ -192,6 +196,111 @@ def test_index_page_served(tmp_path: Path) -> None:
     assert res.status_code == 200
     assert "pr-learner" in res.text
     assert "vue" in res.text.lower()
+
+
+# --- content_format 全链路（docs/decisions/0005）---
+
+
+def test_create_knowledge_html_lands_as_html(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    res = client.post(
+        "/api/knowledge",
+        json={
+            "title": "内核融合",
+            "category": "cuda",
+            "content": "<p>正文</p><p>第二段</p>",
+            "content_format": "html",
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["path"].endswith(".html")
+
+
+def test_create_knowledge_accepts_loose_format_spelling(tmp_path: Path) -> None:
+    """`"HTML"` 要被归一化而不是吃 422——写请求体的可能是个 agent。"""
+    client = _client(tmp_path)
+    res = client.post(
+        "/api/knowledge",
+        json={
+            "title": "t",
+            "category": "c",
+            "content": "<p>a</p><p>b</p>",
+            "content_format": "HTML",
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["path"].endswith(".html")
+
+    # 不认识的值降级成 markdown，同样不报错
+    res = client.post(
+        "/api/knowledge",
+        json={"title": "t2", "category": "c", "content": "正文", "content_format": "xml"},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["path"].endswith(".md")
+
+
+def test_approve_draft_honors_content_format(tmp_path: Path) -> None:
+    """approve 请求体里的格式决定落盘扩展名，且正文能按纯文本被搜到。"""
+    client = _client(tmp_path)
+    draft = client.post(
+        "/api/drafts",
+        json={
+            "title": "草稿标题",
+            "category": "cuda",
+            "content": "<p>通过<strong>内核融合</strong>省掉一次全局内存往返。</p>",
+            "content_format": "html",
+        },
+    ).json()
+    assert draft["content_format"] == "html"
+
+    res = client.post(
+        f"/api/drafts/{draft['id']}/approve",
+        json={
+            "title": "草稿标题",
+            "category": "cuda",
+            "content": draft["content"],
+            "content_format": draft["content_format"],
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["path"].endswith(".html")
+    # strip_tags 后检索：被行内标签切开的词也能命中，标签名不会命中
+    assert client.get("/api/search", params={"keyword": "内核融合"}).json()
+    assert client.get("/api/search", params={"keyword": "strong"}).json() == []
+
+
+def test_list_drafts_backfills_format_for_old_drafts(tmp_path: Path) -> None:
+    """旧草稿 JSON 没有 content_format，读取时补成 markdown（不嗅探）。"""
+    import json
+
+    client = _client(tmp_path)
+    drafts_dir = tmp_path / "knowledge" / ".drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    (drafts_dir / "old12345.json").write_text(
+        json.dumps(
+            {
+                "id": "old12345",
+                "title": "老草稿",
+                "category": "分类",
+                "content": "<p>就算长得像 HTML 也按构造是 markdown</p>",
+                "tags": [],
+                "source_pr": "",
+                "created_at": "2025-01-01T00:00:00",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    got = client.get("/api/drafts").json()
+    assert [d["content_format"] for d in got] == ["markdown"]
+
+
+def test_vendor_mounted_but_source_dir_not_public(tmp_path: Path) -> None:
+    """只挂 /static/vendor：本服务无鉴权，static/ 是源码目录，不该整个公开。"""
+    client = _client(tmp_path)
+    assert client.get("/static/vendor/purify.min.js").status_code == 200
+    assert client.get("/static/index.html").status_code == 404
 
 
 # --- 查找 PR ---
