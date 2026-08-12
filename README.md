@@ -1,6 +1,7 @@
 # pr-learner
 
-用 agent 阅读 GitHub PR，把读到的知识分类沉淀成 Markdown 知识库，并提供 Web/API 提交分析与检索。
+用 agent 阅读 GitHub PR，把读到的知识分类沉淀成文件知识库，并提供 Web/API 提交分析与检索。
+正文默认是**受限 HTML 片段**：代码高亮、对比表格、mermaid 图、折叠区块与卡片排版都能用（历史 Markdown 继续可读）。
 
 ## 工作方式
 
@@ -12,8 +13,11 @@
    每条都有跳转链接和「分析此 PR」按钮，一键接到下一步。
 1. **提交** — 在页面填 PR 地址 + LLM 凭证（base_url/api_key/model，两个页面共用一份）。
 2. **分析** — 服务端用 `gh` 拉取 PR，调 LLM 分析生成草稿。
-3. **review** — 在「待审草稿」页编辑标题/分类/标签/正文（左右分屏，右侧实时 Markdown 预览），确认后入库。
-4. **检索** — 按关键词/分类/标签查询已沉淀的知识，正文按 Markdown 渲染。
+3. **review** — 在「待审草稿」页编辑标题/分类/标签/正文（左右分屏，右侧实时预览，可切 HTML / Markdown），确认后入库。
+   预览区若出现「⚠ 已移除 N 处不允许的标签或属性」，说明模型写了白名单外的东西（最常见是代码里的
+   `vector<int>` 没转义成 `vector&lt;int&gt;`，不改的话入库后那半行代码会**看不见**）。
+4. **检索** — 按关键词/分类/标签查询已沉淀的知识。折叠态给三行纯文本摘录，展开才做富渲染
+   （代码高亮、表格横滚、mermaid 出图、`<details>` 可折叠）。
 
 > 查找 PR 的能力边界：GitHub 搜索只索引 PR 的标题、描述和评论，**不索引 diff**，
 > 所以「哪个 PR 改了某个函数」这类问题可能找不到。另外 GitHub 搜索接口限流 30 次/分钟。
@@ -79,13 +83,24 @@ docker compose down              # 停止
 uv run pr-learner discover "cache" --repo owner/repo --state merged   # 搜索相关 PR
 uv run pr-learner fetch owner/repo 123                 # 拉取 PR，输出 Markdown 供阅读
 uv run pr-learner draft "标题" 分类 内容.md            # 生成待审草稿（供页面 review）
+uv run pr-learner save "标题" 分类 正文.html --content-format html   # 正文按 HTML 入库
 uv run pr-learner search --keyword 重试                # 检索知识
 uv run pr-learner categories                           # 分类统计
 uv run pr-learner reindex                              # 重建 knowledge/index.md
+uv run pr-learner convert                              # 历史 .md 转 HTML（默认只打印清单）
+uv run pr-learner convert --apply                      # 真正写盘（会删原 .md，先提交或 stash）
 ```
 
 > `discover` 命令**不调 LLM**，直接把 GitHub 搜索语法传给 `gh`——agent 自己就会写搜索语法。
 > 页面上的「查找 PR」才需要模型把中文关键词翻成搜索语法。
+
+> `convert` 转出来的 HTML 只有标题/列表/表格/代码块，**没有卡片、折叠和图表**——
+> 那些要重新走一次「分析 PR」才有。
+
+## 前端依赖
+
+Vue / marked / DOMPurify / highlight.js / mermaid 全部本地打包在 `src/pr_learner/static/vendor/`，
+**不走 CDN**，断网也能用。版本、SHA256 与更新方式见 [docs/vendor.md](./docs/vendor.md)。
 
 ## 测试
 

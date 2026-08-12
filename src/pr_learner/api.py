@@ -15,7 +15,8 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
 
 from pr_learner import analyze as analyze_mod
 from pr_learner import discover as discover_mod
@@ -30,6 +31,16 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="pr-learner 知识查询", version="0.1.0")
 
+# 前端依赖（vue / marked / DOMPurify / highlight.js / mermaid）全部本地 vendor。
+# 只挂 vendor 子目录，**不挂整个 static/**：本服务无鉴权，static/ 是源码目录，
+# 以后往里放的东西不该自动变成公开 URL。目录不存在时 StaticFiles 构造即抛异常，
+# 「忘了下载 vendor」于是变成启动即失败，而不是页面白屏。
+app.mount(
+    "/static/vendor",
+    StaticFiles(directory=STATIC_DIR / "vendor"),
+    name="vendor",
+)
+
 
 def _sse(evt: dict) -> str:
     """把一个事件 dict 编码成一行 SSE。"""
@@ -41,9 +52,18 @@ class KnowledgeIn(BaseModel):
 
     title: str = Field(..., min_length=1, description="知识标题")
     category: str = Field(..., min_length=1, description="分类")
-    content: str = Field(..., min_length=1, description="正文 Markdown")
+    content: str = Field(..., min_length=1, description="正文 Markdown 或 HTML 片段")
     tags: list[str] = Field(default_factory=list, description="标签")
     source_pr: str = Field(default="", description="来源 PR，如 owner/repo#123")
+    content_format: str = Field(
+        default=store.DEFAULT_CONTENT_FORMAT, description="markdown / html，决定落盘扩展名"
+    )
+
+    # 不用 Literal["markdown","html"]：那会让手写 "HTML" 的 agent 吃 422。
+    # 归一化到合法值更符合本项目「降级而不报错」的一贯做法。
+    _norm_format = field_validator("content_format", mode="before")(
+        lambda v: store.normalize_content_format(v)
+    )
 
 
 class DraftIn(BaseModel):
@@ -54,6 +74,11 @@ class DraftIn(BaseModel):
     content: str = Field(..., min_length=1)
     tags: list[str] = Field(default_factory=list)
     source_pr: str = Field(default="")
+    content_format: str = Field(default=store.DEFAULT_CONTENT_FORMAT)
+
+    _norm_format = field_validator("content_format", mode="before")(
+        lambda v: store.normalize_content_format(v)
+    )
 
 
 class AnalyzeIn(BaseModel):
@@ -115,6 +140,7 @@ def create_knowledge(item: KnowledgeIn) -> dict:
             item.content,
             tags=item.tags,
             source_pr=item.source_pr or None,
+            content_format=item.content_format,
             knowledge_dir=KNOWLEDGE_DIR,
         )
     except OSError as exc:
@@ -161,6 +187,7 @@ def analyze(item: AnalyzeIn) -> dict:
         fields["content"],
         tags=fields["tags"],
         source_pr=fields["source_pr"],
+        content_format=fields["content_format"],
         knowledge_dir=KNOWLEDGE_DIR,
     )
     return draft
@@ -197,6 +224,7 @@ def analyze_stream(item: AnalyzeIn) -> StreamingResponse:
                     fields["content"],
                     tags=fields["tags"],
                     source_pr=fields["source_pr"],
+                    content_format=fields["content_format"],
                     knowledge_dir=KNOWLEDGE_DIR,
                 )
                 yield _sse({"type": "done", "draft": draft})
@@ -280,13 +308,18 @@ def create_draft(item: DraftIn) -> dict:
         item.content,
         tags=item.tags,
         source_pr=item.source_pr or None,
+        content_format=item.content_format,
         knowledge_dir=KNOWLEDGE_DIR,
     )
 
 
 @app.post("/api/drafts/{draft_id}/approve")
 def approve_draft(draft_id: str, item: KnowledgeIn) -> dict:
-    """用户 review（可修改）后确认保存：转为正式知识并删除草稿。"""
+    """用户 review（可修改）后确认保存：转为正式知识并删除草稿。
+
+    `content_format` 用请求体里的值——那是用户在页面上明确选过的，这里再嗅探一次
+    等于推翻用户的选择。
+    """
     if not drafts_mod.get_draft(draft_id, KNOWLEDGE_DIR):
         raise HTTPException(status_code=404, detail="草稿不存在")
     path = store.save_knowledge(
@@ -295,6 +328,7 @@ def approve_draft(draft_id: str, item: KnowledgeIn) -> dict:
         item.content,
         tags=item.tags,
         source_pr=item.source_pr or None,
+        content_format=item.content_format,
         knowledge_dir=KNOWLEDGE_DIR,
     )
     drafts_mod.delete_draft(draft_id, KNOWLEDGE_DIR)

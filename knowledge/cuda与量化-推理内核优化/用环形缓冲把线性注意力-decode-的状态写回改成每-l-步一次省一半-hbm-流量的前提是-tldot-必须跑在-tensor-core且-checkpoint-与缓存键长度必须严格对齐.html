@@ -1,0 +1,226 @@
+---
+category: CUDA与量化 / 推理内核优化
+content_format: html
+date: '2026-08-11'
+source_pr: sgl-project/sglang#28451
+tags:
+- linear-attention
+- gdn
+- triton
+- cuda-graph
+- prefix-cache
+- roofline
+title: 用环形缓冲把线性注意力 decode 的状态写回改成每 L 步一次：省一半 HBM 流量的前提是 tl.dot 必须跑在 Tensor Core，且
+  checkpoint 与缓存键长度必须严格对齐
+---
+
+<h2>1. 根因：decode 内核被状态读写吃掉带宽</h2>
+<p>GDN（Gated DeltaNet）的 packed decode 每一步都要把完整循环状态 <code>S [HV, V, K]</code> 从 HBM 读出并写回。在 H20-3e 上 batch ≥ 64 时该内核 <strong>70–79% 是 HBM 带宽瓶颈</strong>，瓶颈几乎全部来自这份 per-step 的状态 read+write（fp32 状态约 <code>8dn</code> 字节/步）。</p>
+<p>注意根因不是 FLOPs 不够快，而是「每步都必须持久化整个状态」这个<strong>算法约束</strong>。所以正确的优化方向是改变持久化频率，而不是调 block size / warps。</p>
+<h2>2. 机理：output-only 读出 + 周期性 flush</h2>
+<p>ReplaySSM（Dao AI Lab）的核心观察：decode 每步真正<strong>需要</strong>的只有输出 <code>o</code>，完整的新状态可以延迟落盘。做法是每个物理 slot 维护一个长度 <code>L</code> 的环形缓冲，缓存最近 L 步的 <code>(d, k, g)</code>：</p>
+<ul>
+<li>当前 token 之前的状态可重建为 <code>S = A·S0 + Σ_j w_j · d_j k_jᵀ</code>，其中总衰减 <code>A = Π α_i</code>、回放衰减 <code>w_j = Π_{i&gt;j} α_i</code> 都可以由缓存的 per-step gate <code>g_j</code> 做一次 <code>cumsum</code> 得到，<strong>不需要任何中间状态</strong>；</li>
+<li>重建按 <strong>K 方向分 tile</strong> 进行，每个 tile 一算出来就立刻与 <code>q</code>/<code>k</code> 收缩成标量 <code>Sq</code>/<code>Sk</code>，所以 <code>[V,K]</code> 状态从不落 HBM；</li>
+<li>只在每 L 步的 flush 上把 <code>S_new = αS + d_cur kᵀ</code> 写回 checkpoint。</li>
+</ul>
+<p>结果：per-step 状态流量从 read+write 降到 read-only，约 <code>8dn → 4dn</code>（实测综合约 0.53×），高 batch 下内核理论上限约 1.7×。</p>
+<p>一个很实用的可验证性设计：<strong><code>L=1</code> 时环形缓冲恒为空，内核在代数上退化为原 packed decode</strong>，因此可以把 packed decode 当作位精确 oracle 来做单测。任何「缓存 + 重放」类优化都值得留这样一个退化点。</p>
+<h2>3. 最大的性能陷阱：为了过单测而关掉 Tensor Core</h2>
+<p>重建的计算量是 <code>O(L·K·V)</code>，是 baseline rank-1 更新的 <strong>L 倍</strong>。这笔额外计算只有跑在 Tensor Core 上（fp32→TF32、bf16→bf16 TC）才能被省下来的带宽掩盖。</p>
+<p>PR 中踩到的坑非常典型：为了让单测通过一个过紧的容差，把 <code>tl.dot</code> 强制成 IEEE fp32，<strong>Tensor Core 直接失效，内核慢 10–20×</strong> —— 从 1.5× 收益变成 15× 回退。</p>
+<p>正确做法是反过来：保留 Tensor Core，把测试容差设成「Tensor Core 现实容差」：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>重建误差量级</th>
+<th>单测容差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fp32 输入（TF32 TC）</td>
+<td>~4e-4</td>
+<td>atol 1e-4 / rtol 1e-3</td>
+</tr>
+<tr>
+<td>bf16 输入（bf16 TC）</td>
+<td>~1e-3</td>
+<td>atol 1e-3 / rtol 1e-2</td>
+</tr>
+<tr>
+<td>GDN <code>L=1</code>（dot 恒为 0）</td>
+<td>0</td>
+<td>atol 2e-6，近似位精确</td>
+</tr>
+</tbody>
+</table>
+<p>误差不累积的论证也值得记住：GDN 每步衰减 <code>α &lt; 1</code>，旧的重建误差会被指数衰减，不会跨 flush 累积到长 decode 上。</p>
+<p><strong>可迁移教训：测试容差是被实现的数值路径决定的，不是反过来。当一个单测逼着你改变内核的数值模式时，先问这个改动会不会掉出快路径。</strong></p>
+<h2>4. 状态游标的三个正确性坑</h2>
+<h3>4.1 <code>write_pos</code> 不能从 <code>seq_len</code> 推导</h3>
+<p>直觉上 ring 游标 = <code>seq_len % L</code>，但 <code>seq_len</code> 含 prefill 长度，于是某个 slot 的<strong>第一个 decode 步</strong>就会去读一段全零的「有效」ring。正确做法是把它做成<strong>per 物理 slot 的 decode 步计数器</strong>：slot 分配时置 0（此刻 prefill 刚把 post-prefill 状态写进 <code>temporal[slot]</code>，正好是合法的 <code>S0</code> + 空 ring），每个 forward <strong>只推进一次</strong>（在 attention metadata 构建处），而不是每层推进一次。</p>
+<h3>4.2 CUDA Graph 下必须是静态 buffer + device 侧分支</h3>
+<p>decode forward 只捕获一次并反复 replay，所以 <code>write_pos</code> 不能每步新建 tensor。方案是 per-bs 的<strong>静态 buffer 被 graph 按指针捕获</strong>，每次 replay 在捕获区之外 in-place 刷新（与 <code>mamba_cache_indices</code> 完全同构）；游标推进也放在同处，并用 <code>not in_capture</code> 保护，避免 warmup/capture 用 dummy slot 污染持久计数器。flush 判定做成 <strong>device 侧分支</strong>（<code>is_flush = write_pos == L-1</code>），这样一张图能处理批内各行处于 ring 周期任意位置的情况。</p>
+<h3>4.3 与 radix 前缀缓存的 flush 对齐</h3>
+<p>radix 会在 <code>seq_lens % mamba_track_interval == 0</code> 时快照 <code>temporal[slot]</code>，而 ReplaySSM 下 <code>temporal[slot]</code> 是<strong>滞后的 checkpoint</strong>。因此内核必须<strong>恰好</strong>在这些步 flush。实现上刻意复用了与 <code>schedule_batch.py</code> <strong>完全相同的条件和同一份 post-increment 的 <code>seq_lens_cpu</code></strong>，从根上消除 off-by-one。细节：<code>force_flush</code> 只 OR 进 <code>is_flush</code>，<code>cache_valid</code> 仍用真实 <code>write_pos</code>，保证中途强制 flush 时只读已提交的 ring 条目。</p>
+<p><strong>可迁移教训：两处代码要在「同一步」发生的事，最稳的写法是共享同一个输入和同一个判定表达式，而不是各自重算一份等价条件。</strong></p>
+<h2>5. 评审中挖出的真 bug：finish-donate 的键长/状态长不一致</h2>
+<p>评审者（kaixih）质疑 <code>copy_from</code> 假设源 slot 已 flush，作者逐个调用点核对后发现 <code>cache_finished_req</code> 确实有洞：</p>
+<ul>
+<li><code>L=16</code>，请求 prompt 10 token、输出 20 token，最后一次 flush 在第 26 个 token；</li>
+<li>请求结束时 <code>temporal = state@26</code>，ring 里还挂着 27–30 的更新；</li>
+<li>donate 插入的 radix 节点<strong>键是 30 个 token，状态其实是 @26</strong>，ring 不会被拷贝；</li>
+<li>多轮对话中第二轮前缀正好精确命中该节点，COW 拷进来的状态少了 4 个 token 的更新 → <strong>输出错误</strong>。</li>
+</ul>
+<p>修复：把 donate 的长度截到最后一个 flush 边界（<code>cache_len -= write_pos</code>）并重置游标，让「键长度 == 状态长度」这个不变量重新成立；未缓存的尾部 token 重新 prefill 即可。同时在 <code>copy_from</code> 上写明不变量，并加一个由 <code>SGLANG_DEBUG_MEMORY_POOL</code> 控制的断言（<code>write_pos[src] == 0</code>），避免在正常路径上引入 device sync。</p>
+<p><strong>可迁移教训（很通用）：一旦把「每步都写」改成「延迟写」，所有以「当前状态就是最新状态」为前提的旁路（快照、donate、COW、迁移、PD 分离）都会变成潜在的正确性漏洞。改动前应该枚举所有读该状态的调用点，并把不变量写成文档 + debug 断言，而不是靠记忆。</strong></p>
+<h2>6. 同一个算法在不同 gate 粒度下收益可能反转（GDN vs KDA）</h2>
+<p>GDN 与 KDA 是同一套 delta rule，只差 gate 粒度：GDN 是 per-head 标量 <code>α = exp(g)</code>；KDA 是 per-K 通道 <code>S' = S·Diag(a) + d kᵀ</code>。用一个 <code>IS_KDA</code> constexpr 统一，且保证 GDN 路径逐位不变。</p>
+<p>但非平凡之处在于 ReplaySSM 会<strong>把 gate 累积进重建</strong>，所以 per-K 化远不止改一行：</p>
+<ul>
+<li><code>g_cache</code> 从 <code>[…, L]</code> 变成 <code>[…, L, K]</code>（<strong>大 K 倍</strong>）；</li>
+<li>总衰减/回放衰减变成 per-channel <code>cumsum</code>；</li>
+<li>回放衰减要折到<strong>缓存的 key</strong>上（per-K），而不是折到 <code>d</code> 上（标量）；当前 token 的 <code>α</code> 要折进 <code>q</code>/<code>k</code>，不能事后标量乘。</li>
+</ul>
+<p>于是带宽收益被抹平：省下的状态写回抵不上 K 倍的 gate 缓存流量 + 每步重折 per-K 衰减的计算。这是「小 metadata」在某个维度上不再小的经典反转案例。</p>
+<h2>7. 测试数据分析</h2>
+<h3>7.1 Roofline / 流量（H20-3e，作者）</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>数值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>packed GDN decode 带宽占用（batch ≥ 64）</td>
+<td>70–79%</td>
+<td>属于强带宽瓶颈，值得做流量优化</td>
+</tr>
+<tr>
+<td>ReplaySSM 状态流量比</td>
+<td>~0.53×</td>
+<td>read+write → read-only 的理论减半基本达成</td>
+</tr>
+<tr>
+<td>高 batch 内核理论上限</td>
+<td>~1.7×</td>
+<td>内核层面的天花板，不是 e2e</td>
+</tr>
+</tbody>
+</table>
+<h3>7.2 GDN 内核 microbench（作者，L=8）</h3>
+<table>
+<thead>
+<tr>
+<th>batch</th>
+<th>相对 packed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>&lt; 1×（overhead-bound，非工作点）</td>
+</tr>
+<tr>
+<td>≥ 16</td>
+<td>1.2–1.5×</td>
+</tr>
+</tbody>
+</table>
+<p>结论：收益随 batch 上升，因为只有高 batch 才真正撞带宽墙；batch=1 时内核本身的启动/元数据开销主导。<strong>汇报此类优化必须给出 batch 扫描，单点数字没有意义。</strong></p>
+<h3>7.3 精度 / 端到端质量（Qwen3.5-35B-A3B，GDN-hybrid）</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>flag-on</th>
+<th>baseline</th>
+<th>判读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GSM8K（200 题）</td>
+<td>0.880</td>
+<td>0.860</td>
+<td>差 2pt，200 题的标准误约 ±2.4pt，属噪声，无回退</td>
+</tr>
+<tr>
+<td>GSM8K（早期 GDN-only 切片，radix + CUDA graph 全开）</td>
+<td>0.900</td>
+<td>0.850</td>
+<td>同样在噪声内</td>
+</tr>
+<tr>
+<td>greedy 解码</td>
+<td>首个「近似平票」token 前逐字节一致，之后仅出现 TF32 级别的词翻转，两条续写都正确</td>
+<td>—</td>
+<td>是数值抖动而非状态损坏</td>
+</tr>
+</tbody>
+</table>
+<p>注意这里的方法论价值大于数值本身：<strong>200 题的 GSM8K 只能排除大幅回退，排不掉 1–2pt 级别的退化</strong>；真正能证明「不是状态被写坏」的证据是「greedy 输出在近似平票前逐字节一致」这一条更强的判据。</p>
+<h3>7.4 端到端吞吐</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>128 并发、256/512 in/out（Qwen3.5-35B-A3B）</td>
+<td>TPOT 约 +2.3%</td>
+</tr>
+</tbody>
+</table>
+<p>内核 1.2–1.5× 只换来 e2e 2.3%，原因是该模型 MoE 占比高，GDN 线性层只占 decode 的一小部分（Amdahl）。<strong>GDN-dense 模型收益会更明显。</strong></p>
+<h3>7.5 评审者的 KDA 反测（yyq0210，HV=32, H=16, K=V=128, bf16）</h3>
+<p>方法上比作者的更严格：让 <code>write_pos</code> 走完整 <code>0→…→L-1→0</code> 周期，所以计时同时包含 ring 重建<strong>和</strong> 1/L 概率的 flush（amortized），而不是只测最便宜的 non-flush 步。</p>
+<table>
+<thead>
+<tr>
+<th>batch</th>
+<th>L=8 best / amort</th>
+<th>L=16 best / amort</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>16</td>
+<td>0.85× / 0.74×</td>
+<td>0.85× / 0.78×</td>
+</tr>
+<tr>
+<td>64</td>
+<td>0.88× / 0.77×</td>
+<td>0.88× / 0.82×</td>
+</tr>
+<tr>
+<td>256</td>
+<td>0.93× / 0.82×</td>
+<td>0.93× / 0.87×</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>KDA <strong>在所有 batch 下都比 packed 慢</strong>，且 <code>best</code>（最优单步）与 <code>amort</code>（摊销）差 8–11 个百分点；</li>
+<li>KDA-dense 模型（Kimi-Linear-48B，20 层 KDA）实测 <strong>TPOT 稳定回退 ~3.6%</strong>，与内核 microbench 方向一致；</li>
+<li>相比之下 GDN 在同一 harness 下 batch ≥ 64 摊销后仍有 1.2–1.37×。</li>
+</ul>
+<p>作者确认结论一致，处理方式是<strong>不下线内核，改为在 flag help 与 dispatch 注释里明确标注 KDA decode 会回退、不推荐</strong>（KDA 的 ReplaySSM 收益在投机解码的显存侧，不在 decode），并留待 Blackwell 上重新评估（更高 Tensor Core 吞吐可能翻转 compute/bandwidth 权衡）。</p>
+<p><strong>基准方法论教训：周期性开销必须摊销计时。只报「最好的那一步」会系统性高估 1-in-L flush 类优化的收益，本例中高估约 10 个百分点，足以把「回退」讲成「持平」。</strong></p>
+<h2>8. 其他可复用的工程做法</h2>
+<ul>
+<li><strong>flag-OFF 逐字节等价</strong>：关闭时不分配 ring tensor、metadata 字段保持 <code>None</code>、dispatch 自然落回原 packed decode。给高风险内核优化上开关时，「关闭态零差异」应该是硬性验收项。</li>
+<li><strong>按可评审切片落地</strong>：kernel → 内存池 ring（eager）→ CUDA graph 安全 → 内核 <code>force_flush</code> → radix 对齐 → KDA 泛化，每步一个 commit。这让「哪一步引入回退」可二分定位。</li>
+<li><strong>新内存必须进预算账本</strong>：<code>mamba_cache_per_req</code> 没有计入 ring 字节，导致 KV pool 被超额分配、默认 <code>mem_fraction_static</code> 下 OOM（临时解法是下调该参数）。<strong>任何新增的 per-req 常驻显存都要同步更新容量核算公式，否则表现为「莫名 OOM」而非「显存不够」。</strong></li>
+<li><strong>明确划定未覆盖路径并硬失败</strong>：PD 分离（<code>HybridMambaDecodeReqToTokenPool</code> 没接收这些参数，flag 会静默 no-op）、<code>extra_buffer</code> ping-pong donation（不走 <code>copy_from</code>，游标不会被重置）都用 <code>ValueError</code> 挡住，而不是任其静默走错路。<strong>静默 no-op 比报错危险得多。</strong></li>
+<li><strong>保持与上游 diff 友好</strong>：内核从 vLLM 的 <code>fused_recurrent_replayssm.py</code> 移植时刻意保留原始数学写法，方便后续同步。</li>
+</ul>

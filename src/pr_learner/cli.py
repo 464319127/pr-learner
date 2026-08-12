@@ -6,6 +6,7 @@
     uv run pr-learner save "标题" 分类 内容.md   # 保存一条知识
     uv run pr-learner search --keyword 重试       # 检索知识
     uv run pr-learner categories                 # 查看分类统计
+    uv run pr-learner convert                    # 历史 .md 知识批量转 .html（默认 dry-run）
 """
 
 from __future__ import annotations
@@ -17,10 +18,13 @@ import typer
 
 from pr_learner import drafts as drafts_mod
 from pr_learner import fetch as fetch_mod
+from pr_learner import htmltext
 from pr_learner import query as query_mod
 from pr_learner import store as store_mod
 
 app = typer.Typer(help="pr-learner：阅读 GitHub PR 并分类记录知识", add_completion=False)
+
+_FORMAT_HELP = "正文格式：markdown / html（未知值按 markdown 处理）"
 
 
 @app.command()
@@ -40,12 +44,18 @@ def save(
     content_file: Path = typer.Argument(..., help="知识正文文件；传 - 表示从 stdin 读取"),
     tags: str = typer.Option("", help="逗号分隔的标签"),
     source_pr: str = typer.Option("", help="来源 PR，如 owner/repo#123"),
+    content_format: str = typer.Option(store_mod.DEFAULT_CONTENT_FORMAT, help=_FORMAT_HELP),
 ) -> None:
     """保存一条知识到分类知识库。"""
     content = sys.stdin.read() if str(content_file) == "-" else content_file.read_text("utf-8")
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     path = store_mod.save_knowledge(
-        title, category, content, tags=tag_list, source_pr=source_pr or None
+        title,
+        category,
+        content,
+        tags=tag_list,
+        source_pr=source_pr or None,
+        content_format=content_format,
     )
     typer.echo(f"已保存: {path}")
 
@@ -57,6 +67,7 @@ def draft(
     content_file: Path = typer.Argument(..., help="知识正文文件；传 - 表示从 stdin 读取"),
     tags: str = typer.Option("", help="逗号分隔的标签"),
     source_pr: str = typer.Option("", help="来源 PR，如 owner/repo#123"),
+    content_format: str = typer.Option(store_mod.DEFAULT_CONTENT_FORMAT, help=_FORMAT_HELP),
 ) -> None:
     """写入一条待审草稿，供用户在页面 review 后确认保存。
 
@@ -65,7 +76,12 @@ def draft(
     content = sys.stdin.read() if str(content_file) == "-" else content_file.read_text("utf-8")
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     d = drafts_mod.save_draft(
-        title, category, content, tags=tag_list, source_pr=source_pr or None
+        title,
+        category,
+        content,
+        tags=tag_list,
+        source_pr=source_pr or None,
+        content_format=content_format,
     )
     typer.echo(f"已生成草稿 {d['id']}，请到页面 review：http://localhost:8000")
 
@@ -120,6 +136,51 @@ def reindex() -> None:
     """重建知识库索引 index.md。"""
     path = store_mod.rebuild_index()
     typer.echo(f"已重建索引: {path}")
+
+
+@app.command()
+def convert(
+    apply: bool = typer.Option(False, "--apply", help="真正写盘；不加只打印将要转换的清单"),
+    knowledge_dir: Path = typer.Option(  # noqa: B008 - typer 的参数默认值就是这么写的
+        store_mod.DEFAULT_KNOWLEDGE_DIR, help="知识库根目录"
+    ),
+) -> None:
+    """把历史 Markdown 知识批量转成 HTML（`.md` → `.html`）。
+
+    默认 **dry-run**，只打印清单；确认后加 `--apply` 才写盘。走 `store.rewrite_as`
+    而不是 `save_knowledge`，因为后者会把 `date` 重置成今天——历史知识的日期不该
+    因为一次格式转换而丢失。
+
+    诚实说明：转出来的 HTML 只有标题/列表/表格/代码块，**没有卡片、折叠和图表**，
+    那些要重新走一次「分析 PR」才有。
+    """
+    # 复用 load_all 的取舍规则（跳过 index/README 与任何 `.` 开头的目录），
+    # 避免在这里抄一份必然会走样的过滤条件。
+    todo = [it for it in store_mod.load_all(knowledge_dir) if it["content_format"] == "markdown"]
+    if not todo:
+        typer.echo("没有需要转换的 Markdown 知识")
+        raise typer.Exit()
+
+    converted = 0
+    for it in todo:
+        path = knowledge_dir / it["path"]
+        target = path.with_suffix(".html")
+        if target.exists():
+            typer.echo(f"跳过（同名 .html 已存在）: {it['path']}")
+            continue
+        if not apply:
+            typer.echo(f"将转换: {it['path']} → {target.relative_to(knowledge_dir)}")
+            converted += 1
+            continue
+        store_mod.rewrite_as(path, htmltext.markdown_to_html(it["content"]), "html")
+        typer.echo(f"已转换: {it['path']} → {target.relative_to(knowledge_dir)}")
+        converted += 1
+
+    if not apply:
+        typer.echo(f"\n以上为 dry-run，共 {converted} 条。确认后重跑并加 --apply 才会写盘。")
+        return
+    store_mod.rebuild_index(knowledge_dir)
+    typer.echo(f"\n已转换 {converted} 条，index.md 已重建。")
 
 
 if __name__ == "__main__":

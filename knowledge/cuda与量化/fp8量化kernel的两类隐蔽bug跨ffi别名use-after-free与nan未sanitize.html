@@ -1,0 +1,42 @@
+---
+category: CUDA与量化
+content_format: html
+date: '2026-07-24'
+source_pr: sgl-project/sglang#32188
+tags:
+- fp8
+- cuda-graph
+- use-after-free
+- deepgemm
+- sglang
+- 量化
+title: fp8量化kernel的两类隐蔽bug：跨FFI别名use-after-free与NaN未sanitize
+---
+
+<p>sgl-project/sglang PR #32188 在 H100 <code>deepep-4-gpu-h100</code> CI（TestTBOWithTPAttn）挂掉后，一次性根因修复了两个<strong>独立</strong>的 bug。二者都由 #30924 引入的&quot;统一 JIT 量化 kernel&quot;触发，且都只在特定条件下暴露，是排查 fp8 量化 + CUDA graph 问题的极佳案例。</p>
+<h2>Bug 1：activation scale 的 use-after-free（报错 &quot;pointer resides on host memory&quot;）</h2>
+<ul>
+<li><strong>机理</strong>：sgl-deep-gemm(&lt;=0.1.4.post1) 的 <code>get_mn_major_tma_aligned_tensor</code>，在输入&quot;已经是 MN-major/TMA-aligned&quot;的快路径下，跨 TVM-FFI 边界返回一个<strong>非拥有的 <code>torch::from_blob</code> 别名</strong>（指向入参存储），而不是拷贝。</li>
+<li><strong>触发</strong>：调用方惯用写法 <code>down_input_scale = get_mn_major_tma_aligned_tensor(down_input_scale)</code> 把唯一引用覆盖掉 → 原存储被释放回 caching allocator 并被复用 → 但后续 enqueue 的 down GEMM 仍通过别名读这块 scale → use-after-free。</li>
+<li><strong>为何 #30924 才触发</strong>：旧的 row-major scale 总走&quot;拥有式拷贝&quot;路径；统一 kernel 输出的 scale 本就 MN-major 对齐，第一次命中了 no-op 别名路径。</li>
+<li><strong>为何 TBO 下必现</strong>：two-batch-overlap 让另一个 micro-batch 的层（几十个小分配）恰好插在 rebind 与 GEMM 之间，复用几乎必然发生。Blackwell 不受影响（<code>DEEPGEMM_NEED_TMA_ALIGNED_SCALES=False</code>）。</li>
+<li><strong>修复</strong>：在 sglang wrapper 里，当 deep_gemm 返回的是入参别名时（<code>out.data_ptr() == sf.data_ptr()</code>）直接返回原 tensor，保住所有权。根治则要改 DeepGEMM 自身的所有权语义。</li>
+</ul>
+<h2>Bug 2：统一 kernel 丢失非有限值 sanitization（capture 阶段 NaN）</h2>
+<ul>
+<li><strong>机理</strong>：被替换掉的每个旧 kernel（AOT v1 / JIT v2 / Triton）在转 fp8 前都用 IEEE <code>fminf/fmaxf</code> clamp。IEEE min/max <strong>返回非-NaN 操作数</strong>，所以 NaN/Inf 输入被量化成 ±448。新 kernel 只依赖 SATFINITE，而 SATFINITE <strong>只饱和 inf/越界值，NaN 会被转成 fp8 NaN 码</strong>。（另外 <code>amax=inf</code> → <code>__frcp_rn(inf)=0</code> → <code>inf*0=NaN</code>。）</li>
+<li><strong>为何需要 CI runner 条件才复现</strong>：CUDA graph capture 的 warmup 在复用的、未初始化的 buffer 上跑模型；CI runner 因连续跑 job 显存是脏的、含 NaN 位模式，旧 kernel 会静默 sanitize，新 kernel 把 fp8 NaN 码传进下游 GEMM → <code>NaN detected! sampler: next_token_logits</code>。全新 GPU 发的是清零页，故本地难复现。</li>
+<li><strong>修复</strong>：在 <code>per_token_group_quant.cuh</code> 的 fp32-scale 和 UE8M0 两条路径都恢复 clamp（UE8M0 用 <code>__hmin2/__hmax2</code>）。对有限输入与裸 SATFINITE <strong>逐位一致</strong>（UE8M0 的 2 的幂 scale 已把有限值限制在 ±448）。</li>
+</ul>
+<h2>排查方法论（值得学习的部分）</h2>
+<ol>
+<li><strong>一致性矩阵</strong>：用一张 (配置 × masked路径 × flat路径 × 结果) 表格，证明前一个尝试 #32051（只 revert masked 路径）为何无效——NaN 藏在它没覆盖的 flat 路径（每个 block-fp8 linear 输入量化仍走新 kernel）。这解释了 <code>/rerun-test</code> 为何 5 次都同样 NaN 失败。</li>
+<li><strong>字节级复现</strong>：用 <code>PYTORCH_NO_CUDA_MEMORY_CACHING=1</code>（free 变成真正的 <code>cudaFree</code>）让 bug 1 的未修复路径逐字节复现 CI 报错。</li>
+<li><strong>定量证据</strong>：bug 1 生产路径 repro——未修复 688 个 NaN 行，修复后 0；bug 2 用 NaN/Inf 毒化输入探针对比。单测 105/105（92 原有 + 12 新 sanitization + 1 所有权回归）。</li>
+</ol>
+<h2>可迁移的教训</h2>
+<ul>
+<li>跨 FFI/语言边界返回的 tensor 要警惕<strong>非拥有别名</strong>；<code>x = f(x)</code> 这种自赋值会悄悄释放存储，在有 caching allocator + 异步 enqueue（CUDA graph / stream）时变成 use-after-free。</li>
+<li>fp8/低精度量化 kernel 必须显式处理<strong>非有限值</strong>；不能假设硬件转换指令（SATFINITE）会把 NaN 也饱和掉——它不会。</li>
+<li>CUDA graph capture warmup 跑在<strong>脏显存</strong>上，任何依赖&quot;输入必然有限&quot;的 kernel 都可能在 capture 阶段而非推理阶段炸。</li>
+</ul>

@@ -1,0 +1,87 @@
+---
+category: 推测解码与线性注意力
+content_format: html
+date: '2026-08-12'
+source_pr: sgl-project/sglang#28695
+tags:
+- gdn
+- speculative-decoding
+- triton
+- numerics
+- memory-optimization
+- ssm
+title: 累积型误差不能走近似路径：ReplaySSM 用「一次性输出走 tf32、状态走按位复放」拆掉长文本退化
+---
+
+<p>SGLang PR #28695 把 GDN（Gated DeltaNet）推测解码的 target-verify 从「每个 draft token 快照一份完整 <code>[V,K]</code> 状态以便回滚」换成「每 slot 一个环形缓存 + 冻结检查点」。真正值得沉淀的不是这个替换本身，而是它前后两版之间的那个错误：<strong>同一套近似数学，放在一次性输出上无害，放在累积状态上会随生成长度爆炸。</strong></p>
+
+<div class='card tip'><div class='card-title'>一句话机理</div><p>输出每步算完就被 sampler 消费掉、丢弃，误差不进入下一步；状态是递推的累加器，任何有偏误差都会被后续每一次 flush 继续携带。设计上必须按「误差是否累积」而不是按「代码是否复用」来划分数值精度策略。</p></div>
+
+<h2>决策门：先证明它是带宽瓶颈，再动手省流量</h2>
+<p>RFC 把 Part B 的立项前置在一次测量上——现有递推 verify 前向在目标 batch 下是否已经打到带宽墙。H20-3e（峰值约 3.85 TB/s）、Qwen3.5-35B-A3B 维度：</p>
+<div class='table-wrap'><table><caption>递推 GDN verify 前向的 HBM 带宽利用率</caption><thead><tr><th>batch</th><th>达成带宽占峰值</th></tr></thead><tbody><tr><td>1</td><td>6.7%</td></tr><tr><td>16</td><td>60.8%</td></tr><tr><td>64</td><td>74.7%</td></tr><tr><td>256</td><td>79.4%</td></tr></tbody></table></div>
+<p>结论：大 batch 下确实被 HBM 卡住，而被卡住的流量正是每个 draft token 的状态快照写入；同时那块快照缓冲（<code>intermediate_ssm</code>，TP1 下 11.48 GB）本身就是 spec-decode 显存的大头。<strong>省流量的优化只在 roofline 的带宽侧才有收益，小 batch（6.7%）纯属计算/延迟受限，此时同样的改动不会变快。</strong></p>
+
+<h2>根因：开环 d-fold 破坏了递推的收缩性</h2>
+<p>GDN 递推是 <code>S_t = (I − β_t k_t k_tᵀ) diag(α_t) S_{t-1} + β_t k_t v_tᵀ</code>。逐步扰动增益沿 <code>k</code> 方向是 <code>exp(g)·|1−β| &lt; 1</code>、其他方向 <code>exp(g) &lt; 1</code>——<strong>它是收缩映射，注入的误差会自己衰减掉</strong>。所以 bf16 递推能跑 32k 输出不崩。</p>
+<p>早期版本的 flush 走的是 vLLM 参考实现的做法：把环形缓存里存的 chunked delta <code>d</code> 直接<strong>开环</strong>折进检查点。问题是 <code>d</code> 是经过 chunked delta-rule 的 <code>(I + A)^{-1}</code> UT 变换算出来的，这个变换最坏情况有 <code>2^(BS−1)</code> 的相消误差放大；再叠加 <code>d</code> 本身的存储量化。这条误差不经过收缩递推，而是<strong>直接落在被承诺的状态上，并原封不动喂给之后每一次 flush</strong>。误差随生成长度增长，表现为 16k token 之后退化成重复循环（AIME-2024 0.767 vs 递推 0.933，其中一题把同一行复读了 1210 次）。</p>
+<div class='card warn'><div class='card-title'>为什么上游参考实现没暴露</div><p>vLLM 参考用的是同一套 fold，只在短输出上验证过。<strong>只在短序列上验证过的状态更新，等于没有验证过累积误差。</strong>凡是「每 N 步折一次状态」的方案，回归测试必须包含数万 token 的长输出与 loop 检测指标，而不只是 acc。</p></div>
+<p>评审里 @yyq0210 提了个好问题：普通 chunk-prefill 也用同一个 <code>(I+A)^{-1}</code> 并把结果折进 chunk 边界状态，为什么不出问题？答案在于 <em>次数有界</em>：prefill 的 chunk 数被 prompt 长度封顶，有偏误差没机会走远；而 verify 的 flush 在长生成里是无界重复的。<strong>同一个数值方法安全与否，取决于它在闭环里被迭代多少次。</strong></p>
+
+<h2>修复：闭环 exact fold + 「按位克隆」纪律</h2>
+<pre class='mermaid'>graph TD; A[verify step] --> B[输出重建: 检查点 + d/k 历史, chunked I+A逆, tf32]; A --> C[环形写入: rawv/rawk 激活dtype, g/beta fp32]; C --> D[flush: 顺序复放递推更新]; D --> E[fp32 检查点, 与递推基线按位一致]; B --> F[sampler 消费后丢弃]</pre>
+<p>新的 flush 不再折 <code>d</code>，而是用 <code>gdn_replayssm_exact_fold_kernel</code> 从<strong>原始输入</strong>顺序复放已承诺窗口。关键在于它是 <code>fused_sigmoid_gating_delta_rule_update_kernel</code> 的<strong>按位克隆</strong>——不是「数学等价」，是「浮点位等价」：</p>
+<pre><code class='language-python'># 逐字照抄递推 kernel 的算子顺序，不许改写
+if USE_QK_L2NORM_IN_KERNEL:
+    b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))  # 除法形式 + eps 在 sqrt 内
+b_h *= tl.exp(b_g)                 # decay
+b_v -= tl.sum(b_h * b_k[:, None], 0)  # delta
+b_v *= b_beta
+b_h += b_k[:, None] * b_v[None, :]    # rank-1 update
+</code></pre>
+<p>为此付出的约束（代码里写成了注释警告，值得抄）：</p>
+<ul><li>用<strong>除法形式</strong>的 L2 norm、<code>eps</code> 放在 <code>sqrt</code> 内——改成倒数乘法就不再按位相同。</li><li>beta 用显式 <code>1/(1+exp(-x))</code> 而非 <code>tl.sigmoid</code>。</li><li>tile 保持 <code>[BK, BV=32]</code>、<code>num_warps=1</code>：<strong>归约树的形状由 launch config 决定，改并行度就改了求和顺序</strong>。</li><li>禁止「顺手优化」成 <code>tl.dot</code>——张量核的累加顺序与标量归约不同。</li></ul>
+<p>结果：给定相同输入，折出来的检查点与递推基线 commit 的状态逐位相同，<strong>承诺状态的误差不再含任何长度依赖项</strong>。chunked 数学只保留在误差无法累积的输出侧。</p>
+
+<div class='card note'><div class='card-title'>存原始输入，而不是派生量——「无损」是可以被构造出来的</div><p>环形缓存里存 <code>rawv</code> / 前置归一化的 <code>rawk</code>，用<strong>激活自身的 dtype</strong>（bf16）存。因为它们本来就诞生在 bf16，存进去再读出来是<strong>按定义无损</strong>的，零量化误差且比 fp32 省一半流量。相反，<code>d</code> 是 fp32 算出来的派生量，存成 16 位必然引入量化。<em>选择存什么，比选择存多宽更重要。</em></p></div>
+
+<p>相应地，检查点必须是 fp32（<code>--mamba-ssm-dtype float32</code>，自动设置）：如果检查点是 16 位，每次 flush 都会把刚刚精确折好的状态重新量化一遍，残差重新变成主导项。<strong>精确计算的下游必须有精确的存储承接，否则精确性在落盘那一步就被抹掉。</strong></p>
+
+<h3>被超越的两个「创可贴」</h3>
+<p>PR 过程中先后试过 fp16 检查点、以及借用 #26929 的随机舍入（SR）。评审的分析很清楚：SR 只增加方差，而这里<strong>没有 SR 能修的偏置</strong>；且 Nemotron 那类方案是每步都写状态、误差 O(steps)，ReplaySSM 是 O(flush 次数)，量级本就不同。</p>
+<div class='table-wrap'><table><caption>存储模式消融（Qwen3.6, 180 样本）——两者都没解决根因</caption><thead><tr><th>store mode</th><th>acc</th><th>loop≥50</th><th>loop≥200</th></tr></thead><tbody><tr><td>fp16-RNE</td><td>0.628</td><td>11/180</td><td>5/180</td></tr><tr><td>SR（#26929 方法）</td><td>0.594</td><td>13/180</td><td>12/180</td></tr></tbody></table></div>
+<p>教训：<strong>当缓解手段之间只差几个百分点、且都无法消除长度依赖时，说明在调错的旋钮</strong>；换舍入模式治不了结构性的开环反馈。</p>
+
+<h2>验证分层与数据</h2>
+<div class='table-wrap'><table><caption>正确性验证阶梯（越往下越接近真实系统）</caption><thead><tr><th>层次</th><th>对照物</th><th>结果</th></tr></thead><tbody><tr><td>exact-fold kernel</td><td><code>fused_sigmoid_gating_delta_rule_update</code>（递推权威）</td><td>max_abs ~1e-7（fp32 ulp）</td></tr><tr><td>全流程</td><td>多窗口 verify+commit+fold、部分接受、环形绕回、7 次 flush</td><td>每次 flush 状态 ~1e-7</td></tr><tr><td>在线服务（bs=1）</td><td>14 步 dump，35 token 承诺状态轨迹 vs 精确递推</td><td>1.1e-5；输出处于 bf16 cast 量级；游标协议精确</td></tr><tr><td>端到端</td><td>AIME2025，30 题 ×2，greedy 32k，TP1，NEXTN 3+1</td><td>见下表</td></tr></tbody></table></div>
+<p>这个阶梯本身是可迁移的：<strong>单 kernel 对齐权威实现 → 多周期状态机压测 → 线上 dump 与理论递推逐步比对 → 长输出端到端指标</strong>。前三层能定位误差来源，只有第四层能发现「长度依赖」这种病。</p>
+<div class='table-wrap'><table><caption>AIME2025 端到端（含循环退化计数，不只看 acc）</caption><thead><tr><th>config</th><th>acc</th><th>loop≥50</th><th>loop≥200</th><th>truncations</th><th>avg tokens</th></tr></thead><tbody><tr><td>recurrent 基线</td><td>0.800±0.000</td><td>6/60</td><td>4/60</td><td>10/60</td><td>17858</td></tr><tr><td>replayssm（本 PR）</td><td>0.800±0.000</td><td>4/60</td><td>4/60</td><td>12/60</td><td>18808</td></tr></tbody></table></div>
+<p><code>loop≥50/200</code> 是「重复同一行超过 N 次」的样本数——<strong>退化型 bug 会先在这个指标上出现、acc 可能还看不出来</strong>，把它做成常规回归指标很值得。</p>
+<div class='cols'><div class='col'><div class='table-wrap'><table><caption>35B-A3B TP1，512in/2048out，并发 32（A/B 只差一个开关）</caption><thead><tr><th>指标</th><th>replayssm</th><th>recurrent</th></tr></thead><tbody><tr><td>输出吞吐 tok/s</td><td>1954.1</td><td>1926.4</td></tr><tr><td>平均 TPOT ms</td><td>14.84</td><td>14.56</td></tr><tr><td>耗时 s</td><td>67.1</td><td>68.0</td></tr></tbody></table></div><p>短上下文小模型：<strong>吞吐持平</strong>（顺序复放的开销被 tf32 输出点积 + 激活 dtype 环 + flush 摊销抵掉）。</p></div><div class='col'><div class='table-wrap'><table><caption>122B-A10B TP4，8192in/1024out，NEXTN draft=4</caption><thead><tr><th>并发</th><th>吞吐 Δ</th><th>中位 TPOT Δ</th></tr></thead><tbody><tr><td>8</td><td>+30.3%</td><td>−45.9%</td></tr><tr><td>16</td><td>+26.1%</td><td>−43.6%</td></tr><tr><td>32</td><td>+15.1%</td><td>−39.0%</td></tr></tbody></table></div><p>长上下文大模型才吃到真收益，且<strong>并发越低收益越大</strong>——因为快照流量在总流量中的占比更高。</p></div></div>
+<div class='metric'><span class='metric-label'>spec 暂存显存</span><span class='metric-value'>11.48 GB → 1.81 GB</span></div>
+<p><code>intermediate_ssm</code> 归零，六个环形缓存合计 1.81 GB，暂存缩小 6.4×，TP1 每卡释放 11.5 GB（实测 pool avail 17.48 → 28.96 GB）。<strong>在固定 HBM 预算下这是比吞吐更耐久的收益</strong>：换成 KV 余量即更高可持续并发。</p>
+
+<h2>四个容易踩的工程坑</h2>
+<h3>1. 用「缓冲区是否存在」当特征开关</h3>
+<p>老代码把 <code>MambaPool.replayssm_write_pos is not None</code> 当作 <code>--enable-linear-replayssm</code> 的开关。新特征复用了同一块 <code>write_pos</code> 分配，于是 decode 路径误判自己被启用，<strong>每步多推进一次游标 → 每步注入一个幻影环条目 → 10k token 后退化成重复</strong>。修复是改成判断真正的 flag：</p>
+<pre><code class='language-diff'>-        return getattr(mamba_pool, "replayssm_write_pos", None) is not None
++        return bool(mamba_pool.enable_linear_replayssm)
+</code></pre>
+<p>可迁移教训：<strong>「资源存在性」不是「功能归属」。</strong>两个特征共享存储时，所有权必须由显式 flag 表达，并在配置层强制互斥（这里两个 flag 直接报错拒绝共存，因为游标协议不同：按 decode 前向推进 vs 按接受数推进）。同类防御还加在 CUDA graph replay 上——<code>if not in_capture and forward_mode.is_decode_or_idle()</code>，禁止 TARGET_VERIFY 的 replay 推进 decode 游标。</p>
+<h3>2. Triton：给 <code>tl.dot</code> 的输入 mask 掉整行，会读到未初始化的共享内存</h3>
+<p>在 padding 行（<code>o_s &gt;= spec_len</code>）上 mask token 维的 load，会让这些行在 MMA 的共享内存暂存区保持未初始化，<strong>脏数据泄漏进有效输出列</strong>（在 <code>spec_len=2</code> 时复现）。正确做法是把越界 token 索引<strong>钳制</strong>到合法地址（<code>o_s_safe = tl.where(mask_s, o_s, 0)</code>）、照常整块加载，再靠 <code>q_rnorm/k_rnorm</code> 已为 0 把数值清零。</p>
+<pre><code class='language-python'># 地址钳制而非 mask 掉：staging 被写满，数值上等价
+mask_s = o_s &lt; spec_len
+o_s_safe = tl.where(mask_s, o_s, 0)
+q_tile = tl.load(q + (bos + o_s_safe[:, None]) * stride_q_t + ...,
+                 mask=mask_kt[None, :], other=0.0)   # 不 mask token 维
+</code></pre>
+<h3>3. 环形缓存的溢出必须在协议层被证明不可能</h3>
+<p>提议器（n-gram / MTP）无法被要求限制 draft 数量，而拒绝采样器会读取窗口<strong>每一个</strong>位置的 logits——一个溢出位置就会喂给采样器未初始化的 <code>out</code>，吐出错误 token 并让承诺状态失步。方案是 <strong>early-flush 余量</strong>：<code>next_is_flush = (new_wp + 2*MAX_SPEC_LEN) &gt; MAX_CACHE_LEN</code>，从而每步都保证 <code>write_pos + spec_len &lt;= ring_len</code>。配套约束：环长必须是 2 的幂（<code>&amp;(L-1)</code> 取模）、<code>L &gt;= 2 * max_draft_tokens</code>，并且在 <strong>server_args 与 MambaPool 两处各校验一遍</strong>（前者在 draft 数推导之后运行，后者作为兜底）。<em>不变量要在最靠近使用点的地方再断言一次。</em></p>
+<h3>4. 「不再需要」的缓冲区必须真的不分配</h3>
+<p>评审直接指出：只有跳过 <code>intermediate_ssm</code> 的分配，显存收益才会真正兑现。落地方式是把字段改成 <code>Optional[torch.Tensor]</code>、在开关下置 <code>None</code>，并在理论上不可达的递推回退分支放一个<strong>响亮的 assert</strong> 而不是静默走进 <code>None</code>。同时 conv 的 intermediate window <strong>保留</strong>——conv 回滚仍要用它。<em>省显存的改动要顺着「谁消费它」逐条确认，而不是一刀切。</em></p>
+
+<h2>灰度与兼容面（可抄的谨慎清单）</h2>
+<ul><li>默认关闭、opt-in；GDN + 线性链（<code>topk &lt;= 1</code>）才生效，EAGLE 树验证 / KDA / NPU / CPU <strong>自动回退</strong>到原递推 verify（树验证不行的原因是窗口内交互用了严格下三角因果 mask）。</li><li>池层面再做一次 GDN 收窄（<code>hybrid_gdn_config is not None</code>），保证其他 mamba 模型带上这个 flag 也<strong>逐字节等同于关闭</strong>。</li><li>已知不兼容显式报错而非静默降级：radix prefix caching（extra_buffer 需要设备侧强制 flush 才能让 <code>temporal</code> 与环一致）、PD 分离。</li><li>游标随检查点一起 CPU 往返（<code>get_cpu_copy</code> 返回 3 元组），并<strong>同时接受旧的 2 元组</strong>；slot 复用/拷贝时把 <code>write_pos/cache_base/is_flush</code> 一起清零——<strong>状态机的游标是状态的一部分，任何搬运状态的路径都必须搬运游标。</strong></li><li>CI 红灯归因：Nemotron 那条 OOM 是 mamba2 模型、不走 GDN，与本 PR 无关。<strong>「flag 默认关闭」不等于「与我无关」，但确认无关的正确姿势是指出该路径根本不分配本特征的任何资源。</strong></li></ul>
+
+<div class='takeaway'>把系统里的每一份数值按「误差是否进入下一次迭代」分类：一次性消费的量可以大胆用 tf32/低精度换带宽；进入累积回路的量必须走闭环——从<strong>原始、无损存储的输入</strong>按位复放权威实现，而不是折叠某个近似变换的中间产物。对后者，任何「换舍入模式」「提高存储位宽」的缓解都只是创可贴；判据是残差里有没有长度依赖项，而发现它的唯一手段是长输出 + 重复退化指标的回归测试。</div>

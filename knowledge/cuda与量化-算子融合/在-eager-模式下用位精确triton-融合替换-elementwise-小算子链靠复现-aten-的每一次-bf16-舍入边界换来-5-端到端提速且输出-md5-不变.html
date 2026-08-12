@@ -1,0 +1,100 @@
+---
+category: CUDA与量化 / 算子融合
+content_format: html
+date: '2026-08-12'
+source_pr: sgl-project/sglang#34314
+tags:
+- triton
+- bit-exact
+- rope
+- swiglu
+- diffusion
+- kernel-fusion
+title: 在 eager 模式下用「位精确」Triton 融合替换 elementwise 小算子链：靠复现 aten 的每一次 bf16 舍入边界，换来 5%
+  端到端提速且输出 md5 不变
+---
+
+<h2>背景与根因</h2>
+<p>扩散模型（Ideogram-4 DiT）在 eager 模式下与 torch.compile 的性能差距，在权重反量化开销被前序 PR（#34305）消除后，剩余的主要来源是<strong>大量微小 elementwise kernel 的启动与显存往返</strong>——在 TP=2 的 trace 中约占每步 GPU 时间的 15%。具体两条链：</p>
+<ol>
+<li><strong>Qwen3 风格 rotate-half RoPE</strong>：每层、每个投影（q 和 k 各一次）约 6 个 kernel——四次乘法、两次加/减，外加 <code>qwen3_apply_rotary_pos_emb</code> 内部按切片填充 <code>empty_like</code> 产生的额外写。这些 kernel 全是 memory-bound，算术密度极低，纯粹被 launch overhead 和反复读写同一块显存拖死。</li>
+<li><strong>SwiGLU 的 <code>F.silu(w1(x)) * w3(x)</code></strong>：两次遍历整个 FFN 中间张量（silu 一次、乘一次）。注意这里一个关键约束：gate/up 投影是<strong>两个独立 GEMM</strong>，所以社区常见的 <code>silu_and_mul</code>（要求 gate/up 拼接在同一张量里）用不上——强行用就得先做一次全宽 <code>cat</code>，多出来的这遍读写正好把融合收益吃掉。</li>
+</ol>
+<h2>为什么可以做到位精确（bit-exact）</h2>
+<p>这是本 PR 最有迁移价值的部分。两条链都是纯 elementwise，因此可以逐一复刻 aten 的 bf16 舍入边界，从而在数值上<strong>完全等价</strong>，而不是「误差可接受」：</p>
+<ul>
+<li><strong>RoPE</strong>：eager 计算是 <code>round(round(q1·cos1) − round(q2·sin1))</code>，融合 kernel 写成 <code>round(round(q1·cos1) + round(−q2·sin1))</code>。在 round-to-nearest 下取负是精确操作（只翻符号位），因此两者逐位相等。关键在于<strong>不能省掉中间那次 round</strong>：aten 的每个独立 op 都会把 fp32 opmath 结果写回 bf16，融合 kernel 必须显式插入 <code>round_bf16_to_fp32</code> 来模拟这个截断点。</li>
+<li><strong>SwiGLU</strong>：<code>silu</code> 在 aten 里是<strong>单个 op</strong>（fp32 opmath，只 round 一次），乘法再 round 一次。Triton kernel 里 <code>s = round_bf16_to_fp32(a * tl.sigmoid(a))</code>，然后靠 <code>tl.store</code> 到 bf16 输出隐式完成乘法的那一次 round。前提是 <code>tl.sigmoid</code> 下降到与 aten 相同的 fp32 sigmoid 实现——作者在 100 万个随机 bf16 值上用 <code>torch.equal</code> 验证过这一点。</li>
+</ul>
+<p><strong>心法</strong>：位精确融合的本质是「数出 eager 路径上有几次 dtype 收窄，并在融合 kernel 里精确地重放这些收窄点」。少一次 round 结果就更「准」但不再位精确；多一次则引入额外误差。融合不是自由地在 fp32 里一路算到底。</p>
+<h2>工程化：默认开启 + 自校验闸门</h2>
+<p>两个融合都<strong>默认挂载</strong>，但套在 <code>BitExactFusionGate</code> 后面：</p>
+<ul>
+<li>首次调用同时跑融合与 eager，用 <code>torch.equal</code> 在真实张量上比对；</li>
+<li>不匹配、抛异常、或形状/dtype/连续性不满足（<code>can_use_fused_*</code> 前置检查）时，<strong>永久回退 eager</strong>；</li>
+<li>验证通过后置 <code>verified</code> 标志，后续调用直接走快路，无额外开销。</li>
+</ul>
+<p>这个模式解决了「位精确依赖底层数学库实现，而实现随平台/驱动/Triton 版本变化」的风险：不用靠 CI 矩阵穷举所有硬件，而是让运行时自己在第一步就证明或否证等价性。代价只有一次多余的 eager 计算。前置的 <code>can_use_fused_rope</code> 检查也值得注意——它把 cos/sin 必须是 <code>(B, S, 1, D)</code> 全跨度、bf16、contiguous、同 device、<code>head_dim</code> 偶数等假设全部显式化，而不是在 kernel 里默默做错。</p>
+<p>另外两个小细节：kernel 里 <code>tl.program_id(0).to(tl.int64)</code> 的显式提升，避免大张量（FFN 中间维 × batch × seq 很容易超过 2^31）在偏移计算时 int32 溢出；以及通过 <code>register_custom_op</code> 加 <code>fake_impl</code> 注册，保证 kernel 在 torch.compile / meta 追踪下仍可用。</p>
+<h2>测试数据分析</h2>
+<p>性能（ideogram4-fp8 preset，TP=2，1024²，seed 42，<code>--quality=lossless</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>卡</th>
+<th>分支</th>
+<th style="text-align:right">denoise (s)</th>
+<th style="text-align:right">e2e (s)</th>
+<th>输出 md5</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>H200</td>
+<td>main（eager）</td>
+<td style="text-align:right">5.005</td>
+<td style="text-align:right">5.211</td>
+<td><code>43c0463e…</code></td>
+</tr>
+<tr>
+<td>H200</td>
+<td>本 PR（eager）</td>
+<td style="text-align:right"><strong>4.769（−4.7%）</strong></td>
+<td style="text-align:right">4.898（−6.0%）</td>
+<td><code>43c0463e…</code>（<strong>相同</strong>）</td>
+</tr>
+<tr>
+<td>H100</td>
+<td>main（eager）</td>
+<td style="text-align:right">5.177</td>
+<td style="text-align:right">5.315</td>
+<td><code>14f1d205…</code></td>
+</tr>
+<tr>
+<td>H100</td>
+<td>本 PR（eager）</td>
+<td style="text-align:right"><strong>4.911（−5.1%）</strong></td>
+<td style="text-align:right">5.041（−5.2%）</td>
+<td><code>14f1d205…</code>（<strong>相同</strong>）</td>
+</tr>
+</tbody>
+</table>
+<p>解读：</p>
+<ul>
+<li><strong>收益量级与归因自洽</strong>：trace 显示 elementwise 占每步 GPU 时间约 15%，实测 denoise 降 4.7–5.1%。融合把 RoPE 的 ~6 kernel 压到 1 个、SwiGLU 的 2 遍压到 1 遍，理论上能拿掉这 15% 中的大部分但非全部（融合后仍需一次读写），实测数字落在合理区间，说明性能归因没有被其它因素污染。</li>
+<li><strong>H100 相对收益略高于 H200</strong>：H200 显存带宽更高，memory-bound 的 elementwise 链本身占比更小，因此消除它的相对收益更低。这符合「带宽越紧、kernel 融合越值钱」的直觉。</li>
+<li><strong>md5 完全相同是最强的正确性证据</strong>：整条几十步的去噪链条上任何一位翻转都会被扩散过程放大并改变最终图像哈希。这比「PSNR/余弦相似度达标」这类阈值式指标强得多——它把「数值回归」这一整类风险从审查清单里彻底移除，因此这类 PR 可以默认开启而无需 flag 保护。</li>
+<li><strong>Gate 日志零回退</strong>：说明两张卡上位精确假设都成立，快路径 100% 生效，表格里的收益不是被部分回退稀释后的结果。</li>
+<li>单测层面：融合 RoPE 在多组形状（含 <code>(2,257,16,128)</code>、<code>(1,64,3,64)</code> 这类非规整 seq/head 组合）上与 <code>qwen3_apply_rotary_pos_emb</code> <code>torch.equal</code>；融合 SwiGLU 在 <code>(2,513,3584)</code> 且输入放大 4 倍（覆盖 sigmoid 饱和区）下与 <code>F.silu(a)*b</code> <code>torch.equal</code>；CPU 路径验证回退返回 eager 结果。</li>
+</ul>
+<p>数据的一个空白值得注意：作者明确说明此 PR 是<strong>对未修改的 main</strong> 测量，以隔离本 PR 的效果，与 #34305 的收益是正交的（权重 vs 激活），但没有给出两者叠加后的数字。因此不能直接把两个 PR 的百分比相加。</p>
+<h2>可迁移教训</h2>
+<ol>
+<li><strong>优化 eager 路径之前先做 trace 归因</strong>。「eager 比 compile 慢」不是一个可执行的结论；「elementwise 占 15%，其中 RoPE 6 kernel/投影/层」才是。</li>
+<li><strong>纯 elementwise 链是位精确融合的甜区</strong>。没有 reduction、没有累加顺序问题、没有 tensor-core 的 fp32 累加差异，只要复现 dtype 收窄点即可。一旦涉及 reduction（如 RMSNorm、softmax）或 GEMM，位精确会变得困难甚至不可能，应改用误差界 + 端到端指标来验收。</li>
+<li><strong>现成 kernel 的接口假设可能让它变负优化</strong>。<code>silu_and_mul</code> 要求拼接输入；当 gate/up 是分离 GEMM 时，为迁就接口而加的 <code>cat</code> 会抵消收益。宁可写一个两输入的专用 kernel，也不要为复用而增加一次全宽数据搬运。</li>
+<li><strong>用运行时自校验闸门替代对平台一致性的假设</strong>。首次调用比对 + 永久回退，是把「位精确」这种脆弱性质安全地默认开启的通用手法，也适用于任何依赖底层数学库实现细节的快路径。</li>
+<li><strong>把「输出哈希不变」当作优化 PR 的验收标准</strong>。对确定性推理管线（固定 seed、固定采样器）而言，md5 相同是零成本、零争议的回归门禁，远优于人工看图或阈值指标。</li>
+<li><strong>elementwise kernel 里默认用 int64 算偏移</strong>。生成模型的中间张量很容易越过 int32 边界，这类 bug 只在大分辨率/大 batch 下暴露，排查成本极高。</li>
+<li><strong>可复用的 kernel 文件要能被多个模型共享且合并无冲突</strong>。本 PR 的 <code>rope_rotate_half_bitexact.py</code> 与 ERNIE 的 #34306 是同一份内容，任意顺序合并都干净——共享 kernel 层与模型层挂载点分离，是并行推进多模型优化的组织前提。</li>
+</ol>

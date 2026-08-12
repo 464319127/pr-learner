@@ -1,0 +1,139 @@
+---
+category: CUDA 与量化
+content_format: html
+date: '2026-07-28'
+source_pr: sgl-project/sglang#22392
+tags:
+- fp8
+- cutlass
+- nvjet
+- inductor
+- cuda
+- 性能优化
+title: 用图级替换接入非协作 CUTLASS FP8 GEMM，消除 nvjet 的同步 memset 气泡
+---
+
+<h2>根因</h2>
+<p>nvjet 的 FP8 GEMM 使用 cooperative algorithm（<code>coopA</code>），每次 GEMM 启动前都需要通过 <code>cudaMemsetAsync</code> 将一个 4 字节同步标志清零。这个看似很小的操作会阻断前一个 Triton fusion kernel 与后续 GEMM 的流水衔接，在 GPU profile 中形成约 20 微秒的 pipeline bubble。</p>
+<p>当一次 forward 包含 112 个 GEMM 时，单次 memset 的固定启动与同步成本会累计为约 2.2 毫秒。问题不在 GEMM 的算术吞吐，而在每个算子之间额外插入的同步准备操作。</p>
+<h2>设计与修复</h2>
+<h3>1. 用 CUTLASS 替换 eligible 的 <code>_scaled_mm</code></h3>
+<p>PR 增加了 <code>ReplaceScaledMMWithCutlassPass</code>，在 Inductor 图级别将满足条件的 <code>aten::_scaled_mm.default</code> 节点替换为 <code>sgl_kernel.fp8_scaled_mm</code>。替换只针对可确认安全的节点，其他节点继续走 PyTorch 原生实现：</p>
+<ul>
+<li>输入必须是 CUDA 上的二维 FP8 <code>e4m3fn</code> 矩阵。</li>
+<li>矩阵布局、K 维以及 N/K 维的对齐条件必须满足 CUTLASS kernel 的要求。</li>
+<li>scale 必须是连续的 FP32 tensor，并且支持逐行/逐列或标量形式。</li>
+<li>输出类型限定为 FP16 或 BF16。</li>
+<li>不支持 <code>scale_result</code> 和 <code>use_fast_accum</code> 等 CUTLASS 当前无法等价处理的参数。</li>
+<li>bias 只有在连续、类型匹配且形状为 <code>[N]</code> 时才允许替换。</li>
+</ul>
+<p>这种 graph-local rewrite 比全局替换更适合编译器场景：同一张图中可以同时保留原生路径和 CUTLASS 路径，避免把不满足布局、形状或语义约束的 GEMM 强行导入自定义 kernel。</p>
+<h3>2. 在 Inductor configure 阶段注册 pass</h3>
+<p>替换 pass 仅在 <code>--fp8-gemm-backend cutlass</code> 生效时注册。未启用 CUTLASS 时，<code>aten::_scaled_mm</code> 保持原状，并且 pass 的 UUID 不进入 Inductor cache key；这可以避免非 CUTLASS 配置产生不必要的缓存失效。</p>
+<p>该方案解决了一个实际的编译器集成问题：直接把 Python 层的 FP8 GEMM wrapper 换成自定义 op，会使 Inductor 将 CUTLASS op 视为 opaque custom op，进而无法继续识别前置的 RMSNorm、量化等融合机会。图级替换发生在合适的 Inductor pass 阶段，可以保留已有的 prologue fusion，同时只替换最终的 GEMM 节点。</p>
+<p>更理想的长期方案是让 Inductor 原生理解 CUTLASS GEMM，或增加专门的 pattern/rule，将融合后的 prologue 与 CUTLASS GEMM 一起生成；但这会扩大编译器改动范围，因此本 PR 选择了局部 pass 作为折中。</p>
+<h3>3. 在 GEMM epilogue 中原生支持标量 scale</h3>
+<p>原先 per-tensor scale 可能需要先执行 <code>expand().contiguous()</code>，把一个标量扩展成逐行或逐列 scale。这会额外产生 elementwise kernel，并增加内存读写。</p>
+<p>PR 为 CUTLASS EVT broadcast 节点引入运行时 bool 标志：</p>
+<ul>
+<li>bool 为真时按向量 scale 进行广播。</li>
+<li>bool 为假时将同一个标量用于整个维度。</li>
+</ul>
+<p>因此，同一个 kernel 可以同时处理 per-row/per-column scale 和 per-tensor scalar scale，不需要预先 materialize 扩展后的 scale。实现中通过动态 stride 表达广播模式，要求调用方保证 scale 的形状、连续性和语义与 kernel 的预期一致。</p>
+<h3>4. 增加 <code>out=</code> 实现零拷贝输出</h3>
+<p>自定义 <code>fp8_scaled_mm</code> 新增可选 <code>out</code> 参数。调用方提供预分配的连续输出 tensor 时，GEMM 直接写入该 tensor；未提供时仍然按原逻辑分配新 tensor。</p>
+<p>这消除了 GEMM 完成后的额外 <code>memcpy128</code>。同时，C++ op 对 <code>out</code> 做了必要校验，包括 CUDA 设备、二维形状、dtype、连续布局以及 16 字节对齐。fake implementation 也必须返回传入的 <code>out</code>，否则 FakeTensor/Inductor 的形状传播会与真实执行语义不一致。</p>
+<h2>性能数据</h2>
+<h3>GPU kernel profile</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align:right">修改前</th>
+<th style="text-align:right">修改后</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>memset kernel</td>
+<td style="text-align:right">112</td>
+<td style="text-align:right">0</td>
+<td>每个 nvjet GEMM 前的 4 字节同步清零被消除</td>
+</tr>
+<tr>
+<td>nvjet GEMM</td>
+<td style="text-align:right">112</td>
+<td style="text-align:right">0</td>
+<td>FP8 GEMM 后端切换为 CUTLASS</td>
+</tr>
+<tr>
+<td>CUTLASS GEMM</td>
+<td style="text-align:right">0</td>
+<td style="text-align:right">112</td>
+<td>GEMM 数量不变，仅实现后端改变</td>
+</tr>
+<tr>
+<td>GPU kernel 总数</td>
+<td style="text-align:right">357</td>
+<td style="text-align:right">357</td>
+<td>既消除了额外 kernel，又保留了原有 fusion，没有扩大 kernel 数量</td>
+</tr>
+</tbody>
+</table>
+<p>profile 结果说明优化的主要收益来自删除固定的同步气泡，而不是减少 GEMM 数量。总 kernel 数保持不变也表明前置 Triton fusion 没有因为 custom op 接入而被拆散。</p>
+<h3>端到端 benchmark</h3>
+<p>测试环境为 H200，Qwen3-0.6B FP8，流量分布为生产流量：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align:right">Items/sec</th>
+<th style="text-align:right">相对 baseline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>main baseline</td>
+<td style="text-align:right">30.77</td>
+<td style="text-align:right">-</td>
+</tr>
+<tr>
+<td>叠加 #21734、#21971、#21977</td>
+<td style="text-align:right">37.77</td>
+<td style="text-align:right">+22.7%</td>
+</tr>
+<tr>
+<td>再叠加本 PR</td>
+<td style="text-align:right">38.77</td>
+<td style="text-align:right">+26.0%</td>
+</tr>
+</tbody>
+</table>
+<p>本 PR 相对于已叠加其他优化的配置，从 37.77 提升到 38.77 items/sec，约提升 2.65%；相对于原始 baseline 的总提升为 26.0%。因此不能把全部 +26.0% 归因于 CUTLASS 替换，必须区分依赖 PR 带来的收益与本 PR 的边际收益。</p>
+<h3>数值一致性</h3>
+<p>9 个测试输入、长度覆盖 3 到 7001 tokens，cosine similarity 均超过 0.993。这个指标表明 CUTLASS 与原 nvjet 路径在测试范围内具有较好的数值一致性，但它不是逐元素完全相等证明；FP8 缩放、累加精度和 bias epilogue 仍应在后续测试中覆盖极端值与边界形状。</p>
+<h2>可迁移的工程教训</h2>
+<ol>
+<li>
+<p><strong>固定成本在高频算子链中会被放大。</strong> 4 字节 memset 的带宽成本几乎可以忽略，但 kernel launch、stream 依赖和协作算法初始化带来的延迟会在数十或上百次调用中显著累积。优化 GPU 程序时应同时检查 profile 中的短 kernel、memset 和空隙，而不仅是主 GEMM 的耗时。</p>
+</li>
+<li>
+<p><strong>自定义 op 的性能不能脱离编译器融合单独评估。</strong> 更快的 GEMM kernel 如果被 Inductor 视为 opaque，可能导致前置量化或归一化 fusion 失效，最终端到端性能反而下降。接入 custom op 时要同时验证生成图、fusion 数量和 kernel 间间隙。</p>
+</li>
+<li>
+<p><strong>图级局部重写通常比全局 monkey patch 更可控。</strong> 只替换满足 dtype、布局、对齐、scale 形状和参数语义约束的节点，可以保留兼容性，并让不支持的输入自然回退到原实现。重写条件必须与 kernel 的实际限制保持同步，否则容易出现编译阶段通过、运行阶段失败的问题。</p>
+</li>
+<li>
+<p><strong>标量与向量广播应尽量在 kernel 内表达。</strong> 为了复用逐行/逐列 kernel 而提前 <code>expand</code> 标量，会引入额外 tensor 物化和 elementwise kernel。通过 stride、谓词或运行时模式标志在 epilogue 中处理广播，通常能降低内存流量和调度开销，但必须明确标量 tensor 的连续性、生命周期和指针访问规则。</p>
+</li>
+<li>
+<p><strong><code>out=</code> 接口需要同时更新真实 op、Python wrapper 和 fake 实现。</strong> 只修改 CUDA 实现会导致编译器的 fake tensor 推导、别名分析或输出形状与运行时不一致。任何带预分配输出的 custom op 都应明确 shape、dtype、layout、device、对齐和潜在 aliasing 约束。</p>
+</li>
+<li>
+<p><strong>性能对比应报告边际收益和组合收益。</strong> 当一个 PR 依赖多个 fusion、缓存或 KV cache 优化时，应同时给出纯 baseline、前置优化组合和当前 PR 的结果，否则读者无法判断单项改动的真实贡献。</p>
+</li>
+</ol>
+<h2>风险与验证缺口</h2>
+<p>PR 描述中记录了数值、profile 和 benchmark 验证，但 CI 测试最初标记为尚未通过；评论中多次触发重跑，也没有提供最终完整 CI 结果。因此这类改动仍需重点补充不同 GPU 架构、非对齐形状、标量与向量 scale、bias、空 batch/小矩阵以及非 FP8 回退路径的自动化测试。</p>
+<p>此外，pass 依赖 <code>get_fp8_gemm_runner_backend()</code>、Inductor pass 顺序和特定 PyTorch FX metadata。升级 PyTorch 或改变编译 pipeline 时，应重新验证替换条件、cache key、fake implementation 和融合结果。</p>

@@ -4,9 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pr-learner 知识库</title>
-  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-  <script src="https://unpkg.com/marked@12/marked.min.js"></script>
-  <script src="https://unpkg.com/dompurify@3/dist/purify.min.js"></script>
+  <!-- 依赖全部本地 vendor：内网环境 unpkg 可能不通，且 CDN 换包无人察觉。版本与 SHA256 见 docs/vendor.md -->
+  <script src="/static/vendor/vue.global.prod.js"></script>
+  <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/vendor/purify.min.js"></script>
+  <script src="/static/vendor/highlight.min.js"></script>
+  <!-- 主题 link 必须在内联 style 之前：让下面 .rich-body 的规则在同特异性时胜出 -->
+  <link rel="stylesheet" href="/static/vendor/highlight-github-dark.min.css">
   <style>
     :root {
       --bg: #f6f7f9; --card: #fff; --border: #e3e6ea; --text: #1f2328;
@@ -111,38 +115,94 @@
       display: inline-block; background: var(--tag); border-radius: 999px;
       padding: .1rem .6rem; font-size: .75rem; margin-right: .35rem;
     }
-    .content-preview {
-      font-size: .88rem; color: #24292f; max-height: 7em;
-      overflow: hidden; position: relative;
+    /* 折叠态的纯文本摘录。不做富渲染是刻意的：overflow:hidden 会连内部 .table-wrap 的
+       横滚一起杀掉，一张 400px 的图只露出个碎片，而且 N 条结果全渲染 = 首屏就要下 3.5MB
+       mermaid 去画没人看的图。展开才走 v-rich。 */
+    .content-excerpt {
+      font-size: .88rem; color: #24292f; line-height: 1.6;
+      display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
     }
-    .content-preview.open { max-height: none; }
-    /* GitHub 风格的 markdown 渲染 */
-    .markdown-body { line-height: 1.6; }
-    .markdown-body h1, .markdown-body h2, .markdown-body h3 {
+    /* 知识正文渲染。名字从 .markdown-body 改成 .rich-body：里面装的不再只是 markdown 的产物 */
+    .rich-body { line-height: 1.6; font-size: .9rem; }
+    .rich-body h2, .rich-body h3, .rich-body h4 {
       margin: 1em 0 .5em; line-height: 1.3; font-weight: 600;
     }
-    .markdown-body h1 { font-size: 1.3rem; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
-    .markdown-body h2 { font-size: 1.15rem; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
-    .markdown-body h3 { font-size: 1rem; }
-    .markdown-body p { margin: .6em 0; }
-    .markdown-body ul, .markdown-body ol { padding-left: 1.5em; margin: .6em 0; }
-    .markdown-body li { margin: .25em 0; }
-    .markdown-body code {
+    .rich-body h2 { font-size: 1.15rem; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
+    .rich-body h3 { font-size: 1rem; }
+    .rich-body h4 { font-size: .92rem; }
+    .rich-body p { margin: .6em 0; }
+    .rich-body ul, .rich-body ol { padding-left: 1.5em; margin: .6em 0; }
+    .rich-body li { margin: .25em 0; }
+    /* :not(pre) > 是必须的：.rich-body code 的 (0,1,1) 会盖掉 hljs 主题 .hljs 的 (0,1,0) 底色 */
+    .rich-body :not(pre) > code {
       background: #eff1f3; border-radius: 4px; padding: .12em .35em;
       font-family: ui-monospace, SFMono-Regular, monospace; font-size: .85em;
     }
-    .markdown-body pre {
-      background: #1e1e1e; color: #e6e6e6; border-radius: 8px; padding: .9em 1em;
+    /* 底色对齐 github-dark 主题；padding 交给里层 code，否则高亮背景铺不满。
+       color 必须留着：没带 language- 的块不会被 hljs 上色，靠它才不是深底深字
+       （hljs 主题的 .hljs{color} 直接作用在 code 上，会赢过这里继承下去的颜色） */
+    .rich-body pre {
+      background: #0d1117; color: #c9d1d9; border-radius: 8px; padding: 0;
       overflow-x: auto; font-size: .82rem;
     }
-    .markdown-body pre code { background: none; padding: 0; color: inherit; }
-    .markdown-body blockquote {
+    .rich-body pre > code {
+      display: block; padding: .9em 1em; background: none; font-size: inherit;
+    }
+    .rich-body blockquote {
       margin: .6em 0; padding: .2em .9em; border-left: 3px solid var(--border); color: var(--muted);
     }
-    .markdown-body table { border-collapse: collapse; margin: .6em 0; font-size: .85rem; }
-    .markdown-body th, .markdown-body td { border: 1px solid var(--border); padding: .35em .6em; }
-    .markdown-body th { background: #f2f4f6; }
-    .markdown-body a { color: var(--accent); }
+    .rich-body table { border-collapse: collapse; margin: .6em 0; font-size: .85rem; width: auto; max-width: 100%; }
+    .rich-body th, .rich-body td { border: 1px solid var(--border); padding: .35em .6em; }
+    .rich-body th { background: #f2f4f6; }
+    .rich-body a { color: var(--accent); }
+    .rich-body hr { border: none; border-top: 1px solid var(--border); margin: 1em 0; }
+    .rich-body dt { font-weight: 600; margin-top: .5em; }
+    .rich-body dd { margin: .2em 0 .2em 1.2em; color: var(--muted); }
+    .rich-body figcaption { color: var(--muted); font-size: .8rem; text-align: center; }
+    /* 消毒兜底：库缺失时 renderBody 会退化成转义原文 */
+    .rich-body pre.fallback { white-space: pre-wrap; color: #e6e6e6; padding: .9em 1em; }
+    /* 模型可用的 class（须与 prompt_templates/analyze/html_rules.md 一致，由
+       tests/test_prompt_html_contract.py 钉住）。全部限定在 .rich-body 下：外壳的
+       .panel/.result/.tag/.open 都是全局选择器，漏出去会把预览区搞成页面错位。 */
+    .rich-body .card {
+      border: 1px solid var(--border); border-left: 4px solid var(--muted);
+      border-radius: 8px; padding: .7em .9em; margin: .8em 0; background: #fbfcfd;
+    }
+    .rich-body .card > :first-child { margin-top: 0; }
+    .rich-body .card > :last-child { margin-bottom: 0; }
+    .rich-body .card.tip { border-left-color: #2563eb; }
+    .rich-body .card.note { border-left-color: #6b7280; }
+    .rich-body .card.warn { border-left-color: #d97706; }
+    .rich-body .card.danger { border-left-color: #b91c1c; }
+    .rich-body .card.success { border-left-color: #15803d; }
+    .rich-body .card-title { font-weight: 600; margin-bottom: .3em; }
+    .rich-body .cols {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: .8em; margin: .8em 0;
+    }
+    .rich-body .col { min-width: 0; }
+    .rich-body .table-wrap { overflow-x: auto; margin: .8em 0; }
+    .rich-body .metric { display: inline-flex; flex-direction: column; margin: .3em 1.2em .3em 0; }
+    .rich-body .metric-label { color: var(--muted); font-size: .78rem; }
+    .rich-body .metric-value { font-size: 1.05rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .rich-body .takeaway {
+      background: var(--accent-soft); border: 1px solid #cfdcfb;
+      border-radius: 8px; padding: .7em .9em; margin: .9em 0;
+    }
+    .rich-body .kv { display: grid; grid-template-columns: max-content 1fr; gap: .2em .8em; margin: .6em 0; }
+    .rich-body .center { text-align: center; }
+    .rich-body .nowrap { white-space: nowrap; }
+    .rich-body details {
+      margin: .7em 0; border: 1px solid var(--border); border-radius: 8px;
+      padding: .5em .8em; background: #fbfcfd;
+    }
+    .rich-body summary { cursor: pointer; font-weight: 600; }
+    /* 两根兜底支柱：任意宽/高的内容都不许破版（图和表是最容易撑破的） */
+    .rich-body img, .rich-body svg { max-width: 100%; height: auto; }
+    .mermaid-box { margin: .8em 0; overflow-x: auto; text-align: center; }
+    /* 降级时塞回去的源码块没有里层 code，得自己补 padding（.rich-body pre 的 padding 是 0） */
+    .mermaid-box pre { padding: .9em 1em; text-align: left; }
+    .mermaid-err { color: #b91c1c; font-size: .78rem; margin-top: .3rem; text-align: left; }
     .toggle { color: var(--accent); cursor: pointer; font-size: .8rem; margin-top: .3rem; display: inline-block; }
     .empty { color: var(--muted); text-align: center; padding: 2rem; }
     .form-row { margin-bottom: .8rem; display: flex; flex-direction: column; gap: .3rem; }
@@ -152,10 +212,12 @@
     .split-editor {
       display: grid; grid-template-columns: 1fr 1fr; gap: .75rem;
       border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+      /* 图表和表格比纯文本高得多，定死 360px 不够看；同时留 resize 让用户自己拉高 */
+      height: clamp(320px, 46vh, 620px); resize: vertical;
     }
     @media (max-width: 720px) { .split-editor { grid-template-columns: 1fr; } }
     .split-pane {
-      height: 360px; overflow-y: auto; padding: .7rem .8rem; margin: 0;
+      height: 100%; overflow-y: auto; padding: .7rem .8rem; margin: 0;
       background: var(--card); border: none; border-radius: 0;
     }
     .split-editor textarea.split-pane {
@@ -164,6 +226,11 @@
     }
     .split-editor textarea.split-pane:focus { outline: none; }
     .preview-pane { font-size: .88rem; background: #fafbfc; }
+    /* 草稿的正文格式开关。用单选按钮而不是下拉框：tests/test_frontend_sort.py 会正则抠出
+       页面里排序用的那个 select 核对选项集合，多一个 select 就误伤它 */
+    .fmt-row { display: flex; align-items: center; flex-wrap: wrap; gap: .9rem; font-size: .82rem; }
+    .fmt-opt { display: inline-flex; align-items: center; gap: .3rem; cursor: pointer; color: var(--text); }
+    .fmt-warn { color: #b45309; }
     .toast {
       position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
       background: #111; color: #fff; padding: .6rem 1.2rem; border-radius: 8px;
@@ -412,8 +479,10 @@
             <div>
               <span v-for="t in r.tags" :key="t" class="tag">{{ t }}</span>
             </div>
-            <div class="markdown-body content-preview" :class="{open: r._open}" v-html="renderMd(r.content)"></div>
-            <span class="toggle" @click="r._open = !r._open">
+            <!-- 折叠态只给纯文本摘录，展开才做富渲染：见 CSS 里 .content-excerpt 的注释 -->
+            <div v-if="r._open" class="rich-body" v-rich="r._html"></div>
+            <div v-else class="content-excerpt">{{ excerpt(r) }}</div>
+            <span class="toggle" @click="toggleOpen(r)">
               {{ r._open ? '收起' : '展开全文' }}
             </span>
           </div>
@@ -448,14 +517,29 @@
             <input v-model="d.tagsRaw">
           </div>
           <div class="form-row">
-            <label>正文（Markdown）* — 左侧编辑，右侧实时预览</label>
+            <label>正文 * — 左侧编辑，右侧实时预览</label>
+            <div class="fmt-row">
+              <!-- name 必须带 draft id：共用一个 name 会让多条草稿的单选组合并成一组，
+                   改一条把别的都改了 -->
+              <label class="fmt-opt">
+                <input type="radio" :name="'fmt-' + d.id" value="html"
+                       v-model="d.content_format" @change="renderDraftNow(d)"> HTML
+              </label>
+              <label class="fmt-opt">
+                <input type="radio" :name="'fmt-' + d.id" value="markdown"
+                       v-model="d.content_format" @change="renderDraftNow(d)"> Markdown
+              </label>
+              <!-- 模型漏转义 `<`（C++ 模板参数最常见）或发明新标签时，review 的人当场看得见 -->
+              <span v-if="d._dropped" class="fmt-warn">⚠ 已移除 {{ d._dropped }} 处不允许的标签或属性</span>
+            </div>
             <div class="split-editor">
               <textarea class="split-pane" v-model="d.content"
                         :ref="'ta-' + d.id"
+                        @input="scheduleDraftPreview(d)"
                         @scroll="syncScroll($event, d.id)"></textarea>
-              <div class="split-pane markdown-body preview-pane"
+              <div class="split-pane rich-body preview-pane"
                    :ref="'pv-' + d.id"
-                   v-html="renderMd(d.content)"></div>
+                   v-rich="d._html"></div>
             </div>
           </div>
           <div class="draft-actions">
@@ -472,6 +556,203 @@
 
   <script>
     const { createApp } = Vue;
+
+    /* ===== 知识正文的富渲染：白名单消毒 → 代码高亮 → mermaid（docs/decisions/0005）===== */
+
+    // 模型能用的 class。必须是白名单而不是「未知 class 自然失效」：外壳 CSS 的
+    // .panel/.result/.tag/.open 都是全局选择器，模型随手写个 class='panel' 会立刻套上应用
+    // 外壳的边框背景，把预览区搞成页面错位。这份列表与 prompt_templates/analyze/html_rules.md
+    // 必须一致，由 tests/test_prompt_html_contract.py 钉住——两处不同步 = 模型老实按规则写的
+    // class 被静默剥掉，样式莫名不生效且没有任何报错。
+    const ALLOWED_CLASSES = new Set([
+      'card', 'tip', 'note', 'warn', 'danger', 'success', 'card-title',
+      'cols', 'col', 'table-wrap', 'metric', 'metric-label', 'metric-value',
+      'takeaway', 'kv', 'center', 'nowrap', 'mermaid'
+    ]);
+
+    // DOMPurify 不支持按值过滤 class，只能自己来。language-* 放行是 hljs 的契约。
+    function keptClasses(value) {
+      return String(value || '').trim().split(/\s+/)
+        .filter(c => c && (ALLOWED_CLASSES.has(c) || /^language-[\w+#.-]+$/.test(c)));
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+      ));
+    }
+    // 标签/属性显式白名单。DOMPurify 的默认 profile 会放行 <style> 和内联 style=，
+    // 零配置的 sanitize 本身就是个洞；显式列出还隐含禁掉了所有 on* 事件属性。
+    // 允许 <img> 是一次取舍：PR 里的性能曲线截图对这类知识确有价值，代价是读者 IP 暴露给
+    // 图片站、图将来可能 404。要收紧就是从 ALLOWED_TAGS 里删掉 'img' 一个词。
+    const PURIFY_CONFIG = {
+      ALLOWED_TAGS: [
+        'h2', 'h3', 'h4', 'p', 'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+        'table', 'thead', 'tbody', 'tr', 'th', 'td', 'caption',
+        'blockquote', 'hr', 'br', 'div', 'span', 'section', 'details', 'summary',
+        'figure', 'figcaption', 'pre', 'code',
+        'strong', 'em', 'kbd', 'samp', 'var', 'sup', 'sub', 'del', 'ins', 'mark', 'abbr',
+        'a', 'img'
+      ],
+      ALLOWED_ATTR: ['class', 'href', 'title', 'open', 'colspan', 'rowspan', 'scope', 'alt', 'src'],
+      ALLOWED_URI_REGEXP: /^(?:https?:|mailto:|#)/i,
+      ALLOW_DATA_ATTR: false,
+    };
+
+    if (window.DOMPurify) {
+      DOMPurify.addHook('afterSanitizeAttributes', node => {
+        if (node.hasAttribute && node.hasAttribute('class')) {
+          const kept = keptClasses(node.getAttribute('class'));
+          if (kept.length) node.setAttribute('class', kept.join(' '));
+          else node.removeAttribute('class');
+        }
+        // target 不在默认白名单里，只能事后补；rel 挡住新窗口反向操控 window.opener
+        if (node.tagName === 'A' && /^https?:/i.test(node.getAttribute('href') || '')) {
+          node.setAttribute('target', '_blank');
+          node.setAttribute('rel', 'noopener noreferrer');
+        }
+        if (node.tagName === 'IMG') {
+          node.setAttribute('loading', 'lazy');
+          node.setAttribute('referrerpolicy', 'no-referrer');
+        }
+      });
+    }
+
+    if (window.hljs) {
+      // highlight.js 没有 cuda 语言（languages/cuda.min.js 是 404），模型不听话时兜住
+      hljs.registerAliases(['cuda', 'cu', 'cuh'], { languageName: 'cpp' });
+      // 正文已经过消毒，hljs 那句 unescaped HTML 的警告只是噪音
+      hljs.configure({ ignoreUnescapedHTML: true });
+    }
+    function highlightIn(el) {
+      if (!window.hljs) return;   // vendor 缺失就保持无色，别把整块正文一起拖没
+      el.querySelectorAll('pre > code[class*="language-"]').forEach(code => {
+        if (code.dataset.hlDone) return;
+        try { hljs.highlightElement(code); } catch (e) { /* 单块失败不影响其他块 */ }
+        code.dataset.hlDone = '1';
+      });
+    }
+
+    // mermaid 3.5 MB，只在页面上真的出现图表时才下载；单例 Promise 保证只下一次
+    let mermaidPromise = null;
+    function loadMermaid() {
+      if (mermaidPromise) return mermaidPromise;
+      mermaidPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = '/static/vendor/mermaid.min.js';
+        s.onload = () => {
+          // securityLevel:'strict' 是一处刻意的信任边界：mermaid 产出的 SVG **不过**我们的
+          // sanitizer（白名单里没有任何 SVG 标签，过一遍就全没了）。源码本身已是消毒后 <pre>
+          // 里的纯文本，唯一注入面是 mermaid 怎么处理 label 里的 HTML，strict 会把它编码掉。
+          // suppressErrorRendering:true：模型写错 mermaid 语法是常态，默认会往 DOM 里塞一个
+          // 巨大的红色错误 SVG；关掉后我们自己 catch，降级成「源码 + 一行错误」更有用。
+          window.mermaid.initialize({
+            startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true,
+          });
+          resolve(window.mermaid);
+        };
+        s.onerror = () => reject(new Error('图表渲染库不可用'));
+        document.head.appendChild(s);
+      });
+      return mermaidPromise;
+    }
+
+    // 源码 → SVG 缓存。mermaid.run() 靠 DOM 上的 data-processed 判重，而每次重渲染都会重建
+    // innerHTML、标记随之消失，必然重复渲染；render() 是纯函数式（源码进、SVG 出），配这个
+    // Map 才能真正判重——源码没变就同步命中缓存，打字时零闪烁。
+    const mermaidCache = new Map();
+    let mermaidSeq = 0;
+
+    function swapMermaid(pre, build) {
+      const box = document.createElement('div');
+      box.className = 'mermaid-box';
+      build(box);
+      pre.replaceWith(box);
+    }
+    function degradeMermaid(pre, src, msg) {
+      // 用户正在 review，看到语法错误正好能手改，所以降级成源码 + 一行红字而不是空白
+      swapMermaid(pre, box => {
+        const code = document.createElement('pre');
+        code.textContent = src;
+        const err = document.createElement('div');
+        err.className = 'mermaid-err';
+        err.textContent = '图表未渲染：' + msg;
+        box.append(code, err);
+      });
+    }
+
+    async function renderMermaidIn(el) {
+      const blocks = [...el.querySelectorAll('pre.mermaid')];
+      if (!blocks.length) return;
+      const pending = [];
+      for (const pre of blocks) {
+        const src = pre.textContent.trim();
+        const hit = mermaidCache.get(src);
+        // 缓存命中的同步换上，没命中的才等 mermaid 加载
+        if (hit) swapMermaid(pre, box => { box.innerHTML = hit; });
+        else pending.push([pre, src]);
+      }
+      if (!pending.length) return;
+      let mermaid;
+      try {
+        mermaid = await loadMermaid();
+      } catch (e) {
+        pending.forEach(([pre, src]) => degradeMermaid(pre, src, e.message || String(e)));
+        return;
+      }
+      for (const [pre, src] of pending) {
+        try {
+          const { svg } = await mermaid.render('mmd-' + (++mermaidSeq), src);
+          mermaidCache.set(src, svg);
+          if (pre.isConnected) swapMermaid(pre, box => { box.innerHTML = svg; });
+        } catch (e) {
+          degradeMermaid(pre, src, e.message || String(e));   // 逐块 catch，一块坏不牵连其他
+        }
+      }
+    }
+    // 隐藏容器里量不准图的尺寸，而且没人看的时候不该下 3.5 MB：先记下来，等切到该 tab 再补。
+    // 分析完成后 loadDrafts() 时 tab 还是 'analyze'，800ms 后才切到 review，所以草稿预览
+    // 确实会在 display:none 下首次渲染，这条不是理论情况。
+    const pendingRich = new Set();
+
+    function enhanceRich(el) {
+      highlightIn(el);   // 高亮不依赖尺寸，隐藏时也能先做掉
+      if (el.offsetParent === null) { pendingRich.add(el); return; }
+      pendingRich.delete(el);
+      renderMermaidIn(el);
+    }
+
+    function flushPendingRich() {
+      for (const el of [...pendingRich]) {
+        if (!el.isConnected) { pendingRich.delete(el); continue; }
+        if (el.offsetParent === null) continue;
+        pendingRich.delete(el);
+        renderMermaidIn(el);
+      }
+    }
+
+    // 为什么是自定义指令而不是 v-html + nextTick：mermaid 会把 <pre class='mermaid'> 换成
+    // <svg>，而 Vue 只要重新 patch 就会用 _html 覆盖回去、SVG 被抹掉。必须让同一个东西同时
+    // 拥有 innerHTML 和后处理，指令是唯一自然的载体。updated 里比对新旧值同样关键：值没变
+    // 就不重建，否则任何一次无关的响应式变化都会把已渲染的图冲掉。
+    const richDirective = {
+      mounted(el, binding) {
+        el.innerHTML = binding.value || '';
+        enhanceRich(el);
+      },
+      updated(el, binding) {
+        if (binding.value === binding.oldValue) return;
+        el.innerHTML = binding.value || '';
+        enhanceRich(el);
+      },
+      beforeUnmount(el) { pendingRich.delete(el); },
+    };
+
+    // 草稿预览的 debounce 定时器，key 是草稿 id。放在组件外：这些值不需要响应式，
+    // 塞进 data() 只会让 Vue 白包一层 Proxy。
+    const draftTimers = new Map();
+
+
     createApp({
       data() {
         return {
@@ -532,13 +813,60 @@
             ...d,
             tagsRaw: (d.tags || []).join(', '),
             _saving: false,
+            _html: '', _dropped: 0,
           }));
+          this.drafts.forEach(d => this.renderDraftNow(d));
         },
         switchReview() { this.tab = 'review'; this.loadDrafts(); },
         draftValid(d) { return d.title && d.category && d.content; },
-        renderMd(text) {
-          // marked 渲染 + DOMPurify 消毒，防止知识正文里的 HTML/脚本注入
-          return DOMPurify.sanitize(marked.parse(text || ''));
+        renderBody(content, contentFormat) {
+          // HTML 正文直接消毒，Markdown 先 marked 再消毒，**两条分支共用同一份白名单**——
+          // marked 的产物本来就在白名单内，共用意味着「哪些标签能活」只有一处定义。
+          // dropped 用来在草稿页提示「已移除 N 处」：白名单的违规否则全是静默的。
+          const text = content || '';
+          try {
+            const raw = contentFormat === 'html' ? text : marked.parse(text);
+            const html = DOMPurify.sanitize(raw, PURIFY_CONFIG);
+            return { html, dropped: (DOMPurify.removed || []).length };
+          } catch (e) {
+            // 库没加载出来或解析崩了都走这里。宁可显示转义原文，也不能让抛出的异常
+            // 在模板表达式里把 Vue 整个子树变成白屏。
+            return { html: '<pre class="fallback">' + escapeHtml(text) + '</pre>', dropped: 0 };
+          }
+        },
+        renderDraftNow(d) {
+          const out = this.renderBody(d.content, d.content_format);
+          d._html = out.html;
+          d._dropped = out.dropped;
+        },
+        scheduleDraftPreview(d) {
+          // d.content 每次按键都变，但指令看到的是 d._html：300ms 才更新一次，避免每个字符
+          // 都跑一遍 marked + 消毒 + 图表渲染
+          clearTimeout(draftTimers.get(d.id));
+          draftTimers.set(d.id, setTimeout(() => {
+            draftTimers.delete(d.id);
+            this.renderDraftNow(d);
+          }, 300));
+        },
+        toggleOpen(r) {
+          r._open = !r._open;
+          // 消毒结果缓存在条目上：不缓存的话每次无关的响应式变化（toast 定时器等）
+          // 都会让所有展开项重跑一遍 sanitize
+          if (r._open && !r._html) {
+            const out = this.renderBody(r.content, r.content_format);
+            r._html = out.html;
+          }
+        },
+        excerpt(item) {
+          // 折叠态的纯文本摘录。它走 {{ }} 文本绑定、不进 innerHTML，所以这里用廉价正则
+          // 去标签是安全的——这是前提，别把它挪去喂 v-rich。
+          return (item.content || '')
+            .replace(/<[^>]*>/g, ' ')
+            .replace(/&(?:nbsp|amp|lt|gt|quot|#39);/g, ' ')
+            .replace(/[#*`>|]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 300);
         },
         syncScroll(evt, id) {
           // 编辑区滚动时，预览区按相同比例跟随滚动
@@ -701,7 +1029,8 @@
           if (this.tag) p.set('tag', this.tag);
           if (this.filterCategory) p.set('category', this.filterCategory);
           const data = await (await fetch('/api/search?' + p)).json();
-          this.results = data.map(r => ({ ...r, _open: false }));
+          // _html 懒算：展开时才消毒，见 toggleOpen
+          this.results = data.map(r => ({ ...r, _open: false, _html: '' }));
         },
         selectCategory(c) { this.filterCategory = c; this.doSearch(); },
         showToast(msg, err = false) {
@@ -716,6 +1045,8 @@
               title: d.title, category: d.category, content: d.content,
               source_pr: d.source_pr,
               tags: d.tagsRaw.split(',').map(s => s.trim()).filter(Boolean),
+              // 漏了这个字段，HTML 草稿会静默落成 .md
+              content_format: d.content_format,
             };
             const res = await fetch('/api/drafts/' + d.id + '/approve', {
               method: 'POST',
@@ -743,6 +1074,10 @@
           await this.loadDrafts();
         },
       },
+      watch: {
+        // 切 tab 后补渲染那些当时还在 display:none 里的预览区（见 pendingRich 的注释）
+        tab() { this.$nextTick(flushPendingRich); },
+      },
       async mounted() {
         await this.loadCategories();
         await this.loadDrafts();
@@ -750,7 +1085,7 @@
         // 有草稿时默认停在 review 页，否则从查找 PR 开始
         if (this.drafts.length) this.tab = 'review';
       },
-    }).mount('#app');
+    }).directive('rich', richDirective).mount('#app');
   </script>
 </body>
 </html>

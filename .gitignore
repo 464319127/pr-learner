@@ -19,3 +19,6 @@ build/
 
 # 知识库草稿（未审内容，不提交）
 knowledge/.drafts/
+
+# git worktree 目录（.trees/<name> 是挂在本仓库上的独立 worktree，不该被父仓库跟踪）
+.trees/
